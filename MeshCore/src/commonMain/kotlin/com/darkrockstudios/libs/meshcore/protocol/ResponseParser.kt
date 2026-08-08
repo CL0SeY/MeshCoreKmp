@@ -174,7 +174,8 @@ object ResponseParser {
 		if (data.size < 2) return null
 		val index = data[1].toInt() and 0xFF
 		val name = if (data.size >= 34) extractString(data, 2, 32) else ""
-		return Response.ChannelInfo(index = index, name = name)
+		val secret = if (data.size >= 50) data.copyOfRange(34, 50).toHexString() else ""
+		return Response.ChannelInfo(index = index, name = name, secret = secret)
 	}
 
 	private fun parseContact(data: ByteArray): Response.Contact? {

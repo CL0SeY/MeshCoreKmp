@@ -14,6 +14,9 @@ pluginManagement {
         mavenCentral()
     }
 }
+plugins {
+    id("org.gradle.toolchains.foojay-resolver-convention") version "0.10.0"
+}
 
 dependencyResolutionManagement {
     repositories {
@@ -30,4 +33,5 @@ dependencyResolutionManagement {
 }
 include(":MeshCore")
 include(":sample:composeApp")
+include(":wearApp")
 

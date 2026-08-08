@@ -44,6 +44,7 @@ sealed class Response {
 	data class ChannelInfo(
 		val index: Int,
 		val name: String,
+		val secret: String = "",
 	) : Response()
 
 	data object ContactStart : Response()

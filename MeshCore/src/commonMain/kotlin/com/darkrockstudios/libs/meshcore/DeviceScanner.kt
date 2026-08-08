@@ -55,9 +55,13 @@ class DeviceScanner(
 		config: ConnectionConfig = ConnectionConfig(),
 	): DeviceConnection {
 		stopScan()
+		Napier.d(tag = TAG) {
+			"connect(): ${device.identifier} mtu=${config.requestedMtu} commandTimeout=${config.commandTimeout}"
+		}
 
 		val bleConnection = bleAdapter.connect(device)
 		bleConnection.requestMtu(config.requestedMtu)
+		config.connectionPriority?.let { bleConnection.requestConnectionPriority(it) }
 
 		val commandQueue = CommandQueue(
 			connection = bleConnection,

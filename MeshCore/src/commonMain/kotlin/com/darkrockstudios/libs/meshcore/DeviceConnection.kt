@@ -67,6 +67,9 @@ class DeviceConnection internal constructor(
 	val traceData: Flow<Response.TraceData> = commandQueue.pushEvents
 		.filterIsInstance<Response.TraceData>()
 
+	val logData: Flow<Response.LogData> = commandQueue.pushEvents
+		.filterIsInstance<Response.LogData>()
+
 	val newAdverts: Flow<Response.NewAdvert> = commandQueue.pushEvents
 		.filterIsInstance<Response.NewAdvert>()
 
@@ -151,7 +154,7 @@ class DeviceConnection internal constructor(
 			CommandSerializer.getChannel(index),
 			config.commandTimeout,
 		)
-		return Channel(index = resp.index, name = resp.name)
+		return Channel(index = resp.index, name = resp.name, secret = resp.secret)
 	}
 
 	suspend fun getAllChannels(): List<Channel> {
@@ -217,8 +220,12 @@ class DeviceConnection internal constructor(
 		}
 	}
 
-	suspend fun sendChannelMessage(channelIndex: Int, text: String): MessageSentConfirmation {
-		val timestamp = currentTimeSeconds()
+	suspend fun sendChannelMessage(
+		channelIndex: Int,
+		text: String,
+		timestampSeconds: Long? = null,
+	): MessageSentConfirmation {
+		val timestamp = timestampSeconds ?: currentTimeSeconds()
 		val resp = commandQueue.execute<Response>(
 			CommandSerializer.sendChannelMessage(channelIndex, text, timestamp),
 			config.commandTimeout,
