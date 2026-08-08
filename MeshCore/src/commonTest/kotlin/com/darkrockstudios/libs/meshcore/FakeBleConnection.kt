@@ -1,6 +1,7 @@
 package com.darkrockstudios.libs.meshcore
 
 import com.darkrockstudios.libs.meshcore.ble.BleConnection
+import com.darkrockstudios.libs.meshcore.ble.ConnectionPriority
 import com.darkrockstudios.libs.meshcore.ble.ConnectionState
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
@@ -27,6 +28,8 @@ class FakeBleConnection : BleConnection {
 		negotiatedMtu = mtu
 		return mtu
 	}
+
+	override suspend fun requestConnectionPriority(priority: ConnectionPriority): Boolean = true
 
 	override suspend fun disconnect() {
 		_connectionState.value = ConnectionState.Disconnected

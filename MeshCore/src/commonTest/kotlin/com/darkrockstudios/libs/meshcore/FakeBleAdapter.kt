@@ -18,6 +18,12 @@ class FakeBleAdapter(
 		private set
 	override var isBluetoothEnabled: Boolean = true
 
+	/**
+	 * Ignores [filter]: every emitScanResult is forwarded regardless of the
+	 * requested service UUID / name prefix. Fake-driven tests must therefore
+	 * NOT claim that scan-filter UUID isolation is covered — that guarantee is
+	 * only exercised by the real [com.darkrockstudios.libs.meshcore.ble.BlueFalconBleAdapter].
+	 */
 	override fun scan(filter: ScanFilter): Flow<DiscoveredDevice> {
 		scanStarted = true
 		scanStopped = false

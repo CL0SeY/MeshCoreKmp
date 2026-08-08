@@ -71,11 +71,19 @@ class BlueFalconBleAdapter(
 	}
 
 	override suspend fun connect(device: DiscoveredDevice): BleConnection {
-		val peripheral = peripheralCache[device.identifier]
-			?: blueFalcon.retrievePeripheral(device.identifier)
+		// Prefer a fresh peripheral from BlueFalcon's registry on reconnect —
+		// the cache may hold a stale GATT handle from before a deep-sleep wake
+		// that silently never fires onConnectionStateChange. Fall back to the
+		// scan cache, then fail.
+		val freshPeripheral = blueFalcon.retrievePeripheral(device.identifier)
+		val peripheral = freshPeripheral
+			?: peripheralCache[device.identifier]
 			?: throw MeshCoreBleException(
 				"Peripheral not found for identifier: ${device.identifier}"
 			)
+		Napier.d(tag = TAG) {
+			"connect(): ${device.identifier} via ${if (freshPeripheral != null) "BlueFalcon registry" else "scan cache"}"
+		}
 
 		val connection = BlueFalconBleConnection(
 			blueFalcon = blueFalcon,
