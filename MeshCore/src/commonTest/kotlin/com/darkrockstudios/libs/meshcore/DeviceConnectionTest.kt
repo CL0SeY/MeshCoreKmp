@@ -47,13 +47,18 @@ class DeviceConnectionTest {
 		return data
 	}
 
-	private fun createChannelInfoResponse(index: Int, name: String): ByteArray {
-		val data = ByteArray(34)
-		data[0] = 0x12
-		data[1] = index.toByte()
-		name.encodeToByteArray().copyInto(data, 2, 0, minOf(name.length, 32))
-		return data
-	}
+    private fun createChannelInfoResponse(
+        index: Int,
+        name: String,
+        secret: ByteArray = byteArrayOf(),
+    ): ByteArray {
+        val data = ByteArray(if (secret.isEmpty()) 34 else 50)
+        data[0] = 0x12
+        data[1] = index.toByte()
+        name.encodeToByteArray().copyInto(data, 2, 0, minOf(name.length, 32))
+        if (secret.isNotEmpty()) secret.copyInto(data, 34)
+        return data
+    }
 
 	@Test
 	fun getBattery_returnsBatteryInfo() = runTest {
@@ -139,13 +144,14 @@ class DeviceConnectionTest {
 		// Test getChannel
 		launch {
 			while (bleConnection.writtenData.size < 3) { kotlinx.coroutines.yield() }
-			bleConnection.simulateResponse(createChannelInfoResponse(1, "General"))
+            bleConnection.simulateResponse(createChannelInfoResponse(1, "General", ByteArray(16) { it.toByte() }))
 		}
 
-		val channel = connection.getChannel(1)
-		assertEquals(1, channel.index)
-		assertEquals("General", channel.name)
-	}
+        val channel = connection.getChannel(1)
+        assertEquals(1, channel.index)
+        assertEquals("General", channel.name)
+        assertEquals("000102030405060708090a0b0c0d0e0f", channel.secret)
+    }
 
 	@Test
 	fun pollNextMessage_noMessages() = runTest {
@@ -287,6 +293,53 @@ class DeviceConnectionTest {
 		assertEquals(0x19.toByte(), cmd[0]) // CMD_SEND_RAW_DATA
 		assertEquals(0x00.toByte(), cmd[1]) // empty path
 	}
+    @Test
+    fun sendChannelMessage_usesProvidedTimestampSeconds() = runTest {
+        val bleConnection = FakeBleConnection()
+        val queue = CommandQueue(
+            connection = bleConnection,
+            scope = backgroundScope,
+        )
+        testScheduler.advanceUntilIdle()
+        val config = ConnectionConfig(
+            autoSyncTime = false,
+            autoFetchContacts = false,
+            autoFetchChannels = false,
+            autoPollMessages = false,
+        )
+        val connection = DeviceConnection(
+            bleConnection = bleConnection,
+            commandQueue = queue,
+            scope = backgroundScope,
+            config = config,
+        )
+
+        launch {
+            while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+            bleConnection.simulateResponse(createSelfInfoResponse())
+            kotlinx.coroutines.yield()
+            while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+            bleConnection.simulateResponse(createDeviceInfoResponse())
+        }
+        connection.initialize()
+
+        launch {
+            while (bleConnection.writtenData.size < 3) { kotlinx.coroutines.yield() }
+            bleConnection.simulateResponse(byteArrayOf(0x00))
+        }
+
+        connection.sendChannelMessage(
+            channelIndex = 2,
+            text = "Hi",
+            timestampSeconds = 0x78563412L,
+        )
+
+        val command = bleConnection.writtenData[2]
+        assertContentEquals(
+            byteArrayOf(0x03, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78),
+            command.copyOfRange(0, 7),
+        )
+    }
 
 	@Test
 	fun sendBinaryRequest_sendsAndReceivesConfirmation() = runTest {
