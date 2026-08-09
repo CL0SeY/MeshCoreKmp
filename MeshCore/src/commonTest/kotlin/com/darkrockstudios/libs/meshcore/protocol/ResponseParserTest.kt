@@ -127,18 +127,39 @@ class ResponseParserTest {
 		assertEquals("", result.model)
 	}
 
-	@Test
-	fun parse_channelInfo() {
-		val data = ByteArray(34)
-		data[0] = 0x12
-		data[1] = 0x02 // channel index 2
-		"General".encodeToByteArray().copyInto(data, 2)
+    @Test
+    fun parse_channelInfo() {
+        val data = ByteArray(50)
+        data[0] = 0x12
+        data[1] = 0x02 // channel index 2
+        "General".encodeToByteArray().copyInto(data, 2)
+        for (i in 0 until 16) data[34 + i] = i.toByte()
 
-		val result = ResponseParser.parse(data)
-		assertIs<Response.ChannelInfo>(result)
-		assertEquals(2, result.index)
-		assertEquals("General", result.name)
-	}
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals(2, result.index)
+        assertEquals("General", result.name)
+        assertEquals("000102030405060708090a0b0c0d0e0f", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_withoutSecret_returnsEmptySecret() {
+        val data = ByteArray(34)
+        data[0] = 0x12
+        data[1] = 0x02
+        "General".encodeToByteArray().copyInto(data, 2)
+
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_shortResponse_returnsEmptySecret() {
+        val result = ResponseParser.parse(byteArrayOf(0x12, 0x02))
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
 
 	@Test
 	fun parse_messageSent() {
