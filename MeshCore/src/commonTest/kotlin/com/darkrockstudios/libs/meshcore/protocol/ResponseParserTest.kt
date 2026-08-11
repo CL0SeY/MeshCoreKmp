@@ -682,10 +682,12 @@ class ResponseParserTest {
 
 	@Test
 	fun parse_telemetryResponse() {
-		val data = ByteArray(10)
+		// Firmware frame: [0x8B][reserved 0x00][6-byte prefix][telemetry data]
+		val data = ByteArray(11)
 		data[0] = 0x8B.toByte()
-		for (i in 1..6) data[i] = i.toByte()
-		data[7] = 0xDE.toByte(); data[8] = 0xAD.toByte(); data[9] = 0xBE.toByte()
+		data[1] = 0x00 // reserved byte
+		byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06).copyInto(data, 2)
+		data[8] = 0xDE.toByte(); data[9] = 0xAD.toByte(); data[10] = 0xBE.toByte()
 		val result = ResponseParser.parse(data)
 		assertIs<Response.TelemetryResponse>(result)
 		assertEquals("010203040506", result.publicKeyPrefix)
