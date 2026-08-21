@@ -24,15 +24,15 @@ Add the dependency to your `build.gradle` file:
 implementation("com.darkrockstudios:meshcore:0.12.0")
 ```
 
-Create a `BlueFalconBleAdapter` with a platform-specific `BlueFalcon` instance, then pass it to `DeviceScanner`:
+Create a `BlueFalconBleAdapter` with a platform-specific BlueFalcon 3.x engine, then pass it to `DeviceScanner`:
 
 ```kotlin
 // Android
-val blueFalcon = BlueFalcon(context = application)
+val blueFalcon = BlueFalcon(AndroidEngine(application))
 val scanner = DeviceScanner(BlueFalconBleAdapter(blueFalcon))
 
 // iOS
-val blueFalcon = BlueFalcon(context = UIApplication.sharedApplication)
+val blueFalcon = BlueFalcon(IosEngine())
 val scanner = DeviceScanner(BlueFalconBleAdapter(blueFalcon))
 ```                                                                                                                                                                                                                                                                                                                         
 

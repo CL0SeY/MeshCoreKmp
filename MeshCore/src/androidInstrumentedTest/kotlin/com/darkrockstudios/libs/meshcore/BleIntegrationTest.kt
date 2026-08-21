@@ -8,7 +8,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.GrantPermissionRule
 import com.darkrockstudios.libs.meshcore.ble.BlueFalconBleAdapter
-import dev.bluefalcon.BlueFalcon
+import dev.bluefalcon.core.BlueFalcon
+import dev.bluefalcon.engine.android.AndroidEngine
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
 import org.junit.After
@@ -59,8 +60,8 @@ class BleIntegrationTest {
 	@Test
 	fun connectAndRunBasicCommands() = runBlocking {
 		val app = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as Application
-		val blueFalcon = BlueFalcon(context = app)
-		val adapter = BlueFalconBleAdapter(blueFalcon, platformAppContext = app)
+		val blueFalcon = BlueFalcon(AndroidEngine(app))
+		val adapter = BlueFalconBleAdapter(blueFalcon)
 		val scanner = DeviceScanner(adapter)
 
 		scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
