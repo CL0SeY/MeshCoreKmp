@@ -12,6 +12,11 @@ import kotlinx.coroutines.flow.callbackFlow
 
 class BlueFalconBleAdapter(
 	private val blueFalcon: BlueFalcon,
+	/**
+	 * Android: pass the Application [android.content.Context] so connect can
+	 * open a tracked [android.bluetooth.BluetoothGatt]. Ignored on iOS.
+	 */
+	private val platformAppContext: Any? = null,
 ) : BleAdapter {
 
 	private val peripheralCache = mutableMapOf<String, BluetoothPeripheral>()
@@ -85,13 +90,12 @@ class BlueFalconBleAdapter(
 			"connect(): ${device.identifier} via ${if (freshPeripheral != null) "BlueFalcon registry" else "scan cache"}"
 		}
 
-		val connection = BlueFalconBleConnection(
+		return platformOpenBleConnection(
 			blueFalcon = blueFalcon,
 			peripheral = peripheral,
 			deviceIdentifier = device.identifier,
+			platformAppContext = platformAppContext,
 		)
-		connection.connectAndSetup()
-		return connection
 	}
 
 	companion object {
