@@ -228,6 +228,10 @@ class BlueFalconBleConnection internal constructor(
 				throw MeshCoreBleException("Connect timed out after ${connectTimeoutMs}ms")
 			}
 		} catch (e: Exception) {
+			// Best-effort release: BlueFalcon only tracks GATTs after
+			// STATE_CONNECTED, so this may be a no-op for a timed-out connect
+			// (Android uses AndroidGattBleConnection which always closes).
+			runCatching { blueFalcon.disconnect(peripheral) }
 			blueFalcon.delegates.remove(delegate)
 			_connectionState.value = ConnectionState.Disconnected
 			Napier.e(tag = TAG) { "connectAndSetup(): failed: ${e.message}" }
