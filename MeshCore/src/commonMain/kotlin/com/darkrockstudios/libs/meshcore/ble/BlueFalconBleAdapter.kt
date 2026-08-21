@@ -9,7 +9,10 @@ import io.github.aakira.napier.Napier
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 class BlueFalconBleAdapter(
 	private val blueFalcon: BlueFalcon,
@@ -82,16 +85,9 @@ class BlueFalconBleAdapter(
 	}
 
 	override suspend fun connect(device: DiscoveredDevice): BleConnection {
-		// Prefer a fresh peripheral from BlueFalcon's registry on reconnect —
-		// the cache may hold a stale handle from before a deep-sleep wake.
-		val freshPeripheral = blueFalcon.retrievePeripheral(device.identifier)
-		val peripheral = freshPeripheral
-			?: peripheralCache[device.identifier]
-			?: throw MeshCoreBleException(
-				"Peripheral not found for identifier: ${device.identifier}"
-			)
+		val peripheral = resolvePeripheralForConnect(device.identifier)
 		Napier.d(tag = TAG) {
-			"connect(): ${device.identifier} via ${if (freshPeripheral != null) "BlueFalcon registry" else "scan cache"}"
+			"connect(): ${device.identifier} via resolved peripheral uuid=${peripheral.uuid}"
 		}
 
 		return platformOpenBleConnection(
@@ -101,7 +97,69 @@ class BlueFalconBleAdapter(
 		)
 	}
 
+	/**
+	 * BlueFalcon 3.x emits connection/service SharedFlow updates only for
+	 * peripherals present in the engine registry (populated by scan). Prefer
+	 * that registry, then same-process scan cache, then a brief scan, and only
+	 * then [BlueFalcon.retrievePeripheral] with an explicit registry insert —
+	 * never connect a bare retrievePeripheral orphan.
+	 */
+	private suspend fun resolvePeripheralForConnect(identifier: String): BluetoothPeripheral {
+		findInRegistry(identifier)?.let { return it }
+
+		peripheralCache.entries.firstOrNull { it.key.equals(identifier, ignoreCase = true) }
+			?.value
+			?.let { cached ->
+				findInRegistry(cached.uuid)?.let { return it }
+				platformRegisterPeripheral(blueFalcon, cached)
+				peripheralCache[cached.uuid] = cached
+				return cached
+			}
+
+		Napier.d(tag = TAG) {
+			"connect(): $identifier not in BlueFalcon registry — brief scan to register"
+		}
+		val scanned = withTimeoutOrNull(REGISTER_SCAN_TIMEOUT_MS) {
+			scanUntilRegistered(identifier)
+		}
+		if (scanned != null) return scanned
+
+		val retrieved = blueFalcon.retrievePeripheral(identifier)
+			?: throw MeshCoreBleException(
+				"Peripheral not found for identifier: $identifier",
+			)
+		platformRegisterPeripheral(blueFalcon, retrieved)
+		peripheralCache[retrieved.uuid] = retrieved
+		Napier.d(tag = TAG) {
+			"connect(): $identifier registered via retrievePeripheral fallback"
+		}
+		return retrieved
+	}
+
+	private fun findInRegistry(identifier: String): BluetoothPeripheral? =
+		blueFalcon.peripherals.value.firstOrNull {
+			it.uuid.equals(identifier, ignoreCase = true)
+		}
+
+	private suspend fun scanUntilRegistered(identifier: String): BluetoothPeripheral {
+		val scanJob = blueFalcon.engine.scope.launch {
+			runCatching { blueFalcon.scan(emptyList()) }
+		}
+		try {
+			return blueFalcon.peripherals
+				.mapNotNull { set ->
+					set.firstOrNull { it.uuid.equals(identifier, ignoreCase = true) }
+				}
+				.first()
+				.also { peripheralCache[it.uuid] = it }
+		} finally {
+			scanJob.cancel()
+			runCatching { blueFalcon.stopScanning() }
+		}
+	}
+
 	companion object {
 		private const val TAG = "MeshCoreBLE"
+		private const val REGISTER_SCAN_TIMEOUT_MS = 8_000L
 	}
 }
