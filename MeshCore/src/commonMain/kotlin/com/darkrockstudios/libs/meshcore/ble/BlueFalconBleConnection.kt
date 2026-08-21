@@ -37,11 +37,17 @@ class BlueFalconBleConnection internal constructor(
 ) : BleConnection {
 
 	companion object {
-		/** Bounds the MTU exchange so a ghosted BLE stack fails the connect
-		 *  attempt instead of hanging DeviceScanner.connect() forever. */
-		private const val REQUEST_MTU_TIMEOUT_MS = 5_000L
+		/** Bounds the MTU exchange. Failed negotiation is non-fatal; keep this
+		 *  short so a rejected 512-byte request does not add multi-second lag. */
+		private const val REQUEST_MTU_TIMEOUT_MS = 1_500L
+		/** Wait for autoDiscover before issuing a second discoverServices. */
+		private const val EXPLICIT_DISCOVER_AFTER_MS = 500
+		/** Brief settle before retrying CCCD enable after a GATT stack error. */
+		private const val TX_NOTIFY_RETRY_DELAY_MS = 400L
 		private const val WRITE_BACKPRESSURE_RETRY_MS = 20L
 		private const val WRITE_BACKPRESSURE_TIMEOUT_MS = 5_000L
+		/** Default BLE ATT MTU when the peer rejects negotiation. */
+		private const val DEFAULT_ATT_MTU = 23
 		private const val TAG = "MeshCoreBLE"
 	}
 
@@ -72,9 +78,22 @@ class BlueFalconBleConnection internal constructor(
 			val connected = withTimeoutOrNull(connectTimeoutMs) {
 				coroutineScope {
 					val connectedSignal = async {
-						blueFalcon.connectionStateUpdates.first {
-							it.peripheral.uuid == peripheral.uuid &&
-								it.state == BluetoothPeripheralState.Connected
+						// Prefer the reactive flow; also poll connectionState() so a
+						// missed SharedFlow emission (or already-connected race) cannot
+						// stall the whole setup window.
+						while (true) {
+							if (blueFalcon.connectionState(peripheral) ==
+								BluetoothPeripheralState.Connected
+							) {
+								return@async
+							}
+							val update = withTimeoutOrNull(50) {
+								blueFalcon.connectionStateUpdates.first {
+									it.peripheral.uuid.equals(peripheral.uuid, ignoreCase = true) &&
+										it.state == BluetoothPeripheralState.Connected
+								}
+							}
+							if (update != null) return@async
 						}
 					}
 
@@ -84,15 +103,23 @@ class BlueFalconBleConnection internal constructor(
 						"connectAndSetup(): $deviceIdentifier connected → waiting for NUS"
 					}
 
-					// Discovery SharedFlow has no replay. Poll the peripheral after
-					// connect (autoDiscover may already have finished) and request
-					// an explicit discover if services are still empty.
+					// Discovery SharedFlow has no replay. Prefer BlueFalcon's
+					// autoDiscover result; only issue an explicit discover if
+					// services stay empty (avoids a second discoverServices
+					// racing the post-connect queue and breaking CCCD/MTU).
 					var nus = findNusCharacteristics(peripheral)
-					if (nus == null && peripheral.services.isEmpty()) {
-						blueFalcon.discoverServices(peripheral)
-					}
+					var explicitDiscoverRequested = false
+					var waitedMs = 0
 					while (nus == null) {
+						if (!explicitDiscoverRequested &&
+							peripheral.services.isEmpty() &&
+							waitedMs >= EXPLICIT_DISCOVER_AFTER_MS
+						) {
+							blueFalcon.discoverServices(peripheral)
+							explicitDiscoverRequested = true
+						}
 						delay(50)
+						waitedMs += 50
 						nus = findNusCharacteristics(peripheral)
 					}
 					val (rx, tx) = nus
@@ -102,24 +129,7 @@ class BlueFalconBleConnection internal constructor(
 						"connectAndSetup(): NUS rx/tx found → enabling TX notify"
 					}
 
-					when (
-						val subscription =
-							blueFalcon.setNotificationSubscription(peripheral, tx, enabled = true)
-					) {
-						is NotificationSubscriptionResult.Updated -> {
-							if (!subscription.enabled) {
-								throw MeshCoreBleException("TX notifications were not enabled")
-							}
-						}
-						is NotificationSubscriptionResult.Disconnected ->
-							throw MeshCoreBleException("Disconnected while enabling TX notify")
-						is NotificationSubscriptionResult.Unsupported ->
-							throw MeshCoreBleException("TX notifications unsupported")
-						is NotificationSubscriptionResult.Failed ->
-							throw MeshCoreBleException(
-								"Failed to enable TX notify: ${subscription.cause?.message}",
-							)
-					}
+					enableTxNotifications(tx)
 
 					startNotificationCollector(tx)
 					startDisconnectWatcher()
@@ -201,12 +211,18 @@ class BlueFalconBleConnection internal constructor(
 			@Suppress("UNREACHABLE_CODE")
 			error("unreachable")
 		}
-		if (negotiated == null) {
-			Napier.w(tag = TAG) { "requestMtu(): timed out after ${REQUEST_MTU_TIMEOUT_MS}ms" }
-			throw MeshCoreBleException("MTU request timed out after ${REQUEST_MTU_TIMEOUT_MS}ms")
+		if (negotiated != null) {
+			Napier.d(tag = TAG) { "requestMtu(): negotiated $negotiated" }
+			return negotiated
 		}
-		Napier.d(tag = TAG) { "requestMtu(): negotiated $negotiated" }
-		return negotiated
+		// Wear / some Nordic firmwares reject large MTU requests (Android
+		// reports status=4 and leaves ATT at 23). That must not tear down an
+		// otherwise healthy link — MeshCore frames fit the default ATT MTU.
+		val fallback = peripheral.mtuSize ?: DEFAULT_ATT_MTU
+		Napier.w(tag = TAG) {
+			"requestMtu(): no MTU change after ${REQUEST_MTU_TIMEOUT_MS}ms — continuing with $fallback"
+		}
+		return fallback
 	}
 
 	override suspend fun requestConnectionPriority(priority: ConnectionPriority): Boolean {
@@ -237,12 +253,39 @@ class BlueFalconBleConnection internal constructor(
 		scope.cancel()
 	}
 
+	private suspend fun enableTxNotifications(tx: BluetoothCharacteristic) {
+		var lastError: String? = null
+		repeat(2) { attempt ->
+			when (
+				val subscription =
+					blueFalcon.setNotificationSubscription(peripheral, tx, enabled = true)
+			) {
+				is NotificationSubscriptionResult.Updated -> {
+					if (subscription.enabled) return
+					lastError = "TX notifications were not enabled"
+				}
+				is NotificationSubscriptionResult.Disconnected ->
+					throw MeshCoreBleException("Disconnected while enabling TX notify")
+				is NotificationSubscriptionResult.Unsupported ->
+					throw MeshCoreBleException("TX notifications unsupported")
+				is NotificationSubscriptionResult.Failed -> {
+					lastError = subscription.cause?.message ?: "unknown"
+					Napier.w(tag = TAG) {
+						"enableTxNotifications(): attempt ${attempt + 1} failed: $lastError"
+					}
+				}
+			}
+			if (attempt == 0) delay(TX_NOTIFY_RETRY_DELAY_MS)
+		}
+		throw MeshCoreBleException("Failed to enable TX notify: $lastError")
+	}
+
 	private fun startNotificationCollector(tx: BluetoothCharacteristic) {
 		notificationJob?.cancel()
 		notificationJob = scope.launch {
 			blueFalcon.engine.characteristicNotifications
 				.filter {
-					it.peripheral.uuid == peripheral.uuid &&
+					it.peripheral.uuid.equals(peripheral.uuid, ignoreCase = true) &&
 						it.characteristic.uuid == tx.uuid
 				}
 				.collect { notification ->
@@ -255,7 +298,7 @@ class BlueFalconBleConnection internal constructor(
 		disconnectWatchJob?.cancel()
 		disconnectWatchJob = scope.launch {
 			blueFalcon.connectionStateUpdates.first {
-				it.peripheral.uuid == peripheral.uuid &&
+				it.peripheral.uuid.equals(peripheral.uuid, ignoreCase = true) &&
 					it.state == BluetoothPeripheralState.Disconnected
 			}
 			Napier.d(tag = TAG) { "didDisconnect(): $deviceIdentifier" }
