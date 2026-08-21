@@ -1,22 +1,18 @@
 package com.darkrockstudios.libs.meshcore.ble
 
-import dev.bluefalcon.AdvertisementDataRetrievalKeys
-import dev.bluefalcon.BlueFalcon
-import dev.bluefalcon.BlueFalconDelegate
-import dev.bluefalcon.BluetoothManagerState
-import dev.bluefalcon.BluetoothPeripheral
+import dev.bluefalcon.core.BlueFalcon
+import dev.bluefalcon.core.BluetoothManagerState
+import dev.bluefalcon.core.BluetoothPeripheral
+import dev.bluefalcon.core.ServiceFilter
+import dev.bluefalcon.core.toUuid
 import io.github.aakira.napier.Napier
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.launch
 
 class BlueFalconBleAdapter(
 	private val blueFalcon: BlueFalcon,
-	/**
-	 * Android: pass the Application [android.content.Context] so connect can
-	 * open a tracked [android.bluetooth.BluetoothGatt]. Ignored on iOS.
-	 */
-	private val platformAppContext: Any? = null,
 ) : BleAdapter {
 
 	private val peripheralCache = mutableMapOf<String, BluetoothPeripheral>()
@@ -26,60 +22,68 @@ class BlueFalconBleAdapter(
 
 	override fun scan(filter: ScanFilter): Flow<DiscoveredDevice> = callbackFlow {
 		peripheralCache.clear()
+		val emitted = mutableSetOf<String>()
 
-		Napier.d(tag = TAG) { "Starting scan with filter: serviceUuid='${filter.serviceUuid}', namePrefix='${filter.namePrefix}'" }
+		Napier.d(tag = TAG) {
+			"Starting scan with filter: serviceUuid='${filter.serviceUuid}', namePrefix='${filter.namePrefix}'"
+		}
 
-		val delegate = object : BlueFalconDelegate {
-			override fun didDiscoverDevice(
-				bluetoothPeripheral: BluetoothPeripheral,
-				advertisementData: Map<AdvertisementDataRetrievalKeys, Any>,
-			) {
-				val name = bluetoothPeripheral.name
-				Napier.d(tag = TAG) { "didDiscoverDevice: name='$name', uuid='${bluetoothPeripheral.uuid}', rssi=${bluetoothPeripheral.rssi}" }
-				Napier.d(tag = TAG) { "  advertisementData keys: ${advertisementData.keys}" }
+		val collectJob = launch {
+			blueFalcon.peripherals.collect { peripherals ->
+				for (bluetoothPeripheral in peripherals) {
+					val name = bluetoothPeripheral.name
+					Napier.d(tag = TAG) {
+						"didDiscoverDevice: name='$name', uuid='${bluetoothPeripheral.uuid}', rssi=${bluetoothPeripheral.rssi}"
+					}
 
-				if (filter.namePrefix != null && (name == null || !name.startsWith(filter.namePrefix))) {
-					Napier.d(tag = TAG) { "  FILTERED OUT by namePrefix '${filter.namePrefix}'" }
-					return
+					if (filter.namePrefix != null &&
+						(name == null || !name.startsWith(filter.namePrefix))
+					) {
+						Napier.d(tag = TAG) { "  FILTERED OUT by namePrefix '${filter.namePrefix}'" }
+						continue
+					}
+
+					peripheralCache[bluetoothPeripheral.uuid] = bluetoothPeripheral
+					if (!emitted.add(bluetoothPeripheral.uuid)) continue
+
+					val device = DiscoveredDevice(
+						identifier = bluetoothPeripheral.uuid,
+						name = name,
+						rssi = bluetoothPeripheral.rssi?.toInt() ?: 0,
+					)
+					Napier.d(tag = TAG) { "  Emitting device: $device" }
+					trySend(device)
 				}
-
-				peripheralCache[bluetoothPeripheral.uuid] = bluetoothPeripheral
-
-				val device = DiscoveredDevice(
-					identifier = bluetoothPeripheral.uuid,
-					name = name,
-					rssi = bluetoothPeripheral.rssi?.toInt() ?: 0,
-				)
-				Napier.d(tag = TAG) { "  Emitting device: $device" }
-				trySend(device)
 			}
 		}
 
-		blueFalcon.delegates.add(delegate)
-
 		val serviceFilters = if (filter.serviceUuid.isNotBlank()) {
-			createServiceFilters(filter.serviceUuid)
+			listOf(ServiceFilter(filter.serviceUuid.toUuid()))
 		} else {
 			emptyList()
 		}
 		Napier.d(tag = TAG) { "Calling blueFalcon.scan() with ${serviceFilters.size} service filter(s)" }
-		blueFalcon.scan(serviceFilters)
+		launch {
+			blueFalcon.scan(serviceFilters)
+		}
 
 		awaitClose {
-			blueFalcon.stopScanning()
-			blueFalcon.delegates.remove(delegate)
+			collectJob.cancel()
+			blueFalcon.engine.scope.launch {
+				blueFalcon.stopScanning()
+			}
 		}
 	}
 
 	override fun stopScan() {
-		blueFalcon.stopScanning()
+		blueFalcon.engine.scope.launch {
+			blueFalcon.stopScanning()
+		}
 	}
 
 	override suspend fun connect(device: DiscoveredDevice): BleConnection {
 		// Prefer a fresh peripheral from BlueFalcon's registry on reconnect —
-		// the cache may hold a stale GATT handle from before a deep-sleep wake
-		// that silently never fires onConnectionStateChange. Fall back to the
-		// scan cache, then fail.
+		// the cache may hold a stale handle from before a deep-sleep wake.
 		val freshPeripheral = blueFalcon.retrievePeripheral(device.identifier)
 		val peripheral = freshPeripheral
 			?: peripheralCache[device.identifier]
@@ -94,7 +98,6 @@ class BlueFalconBleAdapter(
 			blueFalcon = blueFalcon,
 			peripheral = peripheral,
 			deviceIdentifier = device.identifier,
-			platformAppContext = platformAppContext,
 		)
 	}
 

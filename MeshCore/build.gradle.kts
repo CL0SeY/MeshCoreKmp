@@ -17,13 +17,21 @@ kotlin {
         commonMain.dependencies {
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
-            api(libs.blue.falcon)
+            api(libs.blue.falcon.core)
             api(libs.napier)
         }
 
         commonTest.dependencies {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
+        }
+
+        androidMain.dependencies {
+            api(libs.blue.falcon.engine.android)
+        }
+
+        iosMain.dependencies {
+            api(libs.blue.falcon.engine.ios)
         }
 
         val androidInstrumentedTest by getting {
@@ -54,7 +62,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        minSdk = 21
+        minSdk = 24
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 }

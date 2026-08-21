@@ -1,13 +1,12 @@
 package com.darkrockstudios.libs.meshcore.ble
 
-import dev.bluefalcon.BlueFalcon
-import dev.bluefalcon.BluetoothPeripheral
+import dev.bluefalcon.core.BlueFalcon
+import dev.bluefalcon.core.BluetoothPeripheral
 
 internal actual suspend fun platformOpenBleConnection(
 	blueFalcon: BlueFalcon,
 	peripheral: BluetoothPeripheral,
 	deviceIdentifier: String,
-	platformAppContext: Any?,
 ): BleConnection {
 	val connection =
 		BlueFalconBleConnection(

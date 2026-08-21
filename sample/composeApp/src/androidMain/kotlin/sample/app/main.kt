@@ -10,7 +10,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.darkrockstudios.libs.meshcore.ble.BlueFalconBleAdapter
-import dev.bluefalcon.BlueFalcon
+import dev.bluefalcon.core.BlueFalcon
+import dev.bluefalcon.engine.android.AndroidEngine
 import io.github.aakira.napier.DebugAntilog
 import io.github.aakira.napier.Napier
 
@@ -32,8 +33,8 @@ class AppActivity : ComponentActivity() {
 		super.onCreate(savedInstanceState)
 		enableEdgeToEdge()
 		Napier.base(DebugAntilog())
-		val blueFalcon = BlueFalcon(context = application)
-		bleAdapter = BlueFalconBleAdapter(blueFalcon, platformAppContext = application)
+		val blueFalcon = BlueFalcon(AndroidEngine(application))
+		bleAdapter = BlueFalconBleAdapter(blueFalcon)
 
 		if (hasRequiredPermissions()) {
 			showApp()
