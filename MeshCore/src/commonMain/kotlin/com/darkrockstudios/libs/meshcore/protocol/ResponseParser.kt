@@ -174,7 +174,8 @@ object ResponseParser {
 		if (data.size < 2) return null
 		val index = data[1].toInt() and 0xFF
 		val name = if (data.size >= 34) extractString(data, 2, 32) else ""
-		return Response.ChannelInfo(index = index, name = name)
+		val secret = if (data.size >= 50) data.copyOfRange(34, 50).toHexString() else ""
+		return Response.ChannelInfo(index = index, name = name, secret = secret)
 	}
 
 	private fun parseContact(data: ByteArray): Response.Contact? {
@@ -424,8 +425,10 @@ object ResponseParser {
 	}
 
 	private fun parseTelemetryResponse(data: ByteArray): Response.TelemetryResponse {
-		val prefix = if (data.size >= 7) data.copyOfRange(1, 7).toHexString() else ""
-		val telemetryData = if (data.size > 7) data.copyOfRange(7, data.size) else ByteArray(0)
+		// Wire frame (firmware MyMesh.cpp, meshcore.js, meshcore_py):
+		// [0x8B][reserved 0x00][6-byte public-key prefix][CayenneLPP payload]
+		val prefix = if (data.size >= 8) data.copyOfRange(2, 8).toHexString() else ""
+		val telemetryData = if (data.size > 8) data.copyOfRange(8, data.size) else ByteArray(0)
 		return Response.TelemetryResponse(prefix, telemetryData)
 	}
 

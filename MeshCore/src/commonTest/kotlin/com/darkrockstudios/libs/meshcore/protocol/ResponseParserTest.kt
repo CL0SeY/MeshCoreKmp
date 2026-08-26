@@ -127,18 +127,39 @@ class ResponseParserTest {
 		assertEquals("", result.model)
 	}
 
-	@Test
-	fun parse_channelInfo() {
-		val data = ByteArray(34)
-		data[0] = 0x12
-		data[1] = 0x02 // channel index 2
-		"General".encodeToByteArray().copyInto(data, 2)
+    @Test
+    fun parse_channelInfo() {
+        val data = ByteArray(50)
+        data[0] = 0x12
+        data[1] = 0x02 // channel index 2
+        "General".encodeToByteArray().copyInto(data, 2)
+        for (i in 0 until 16) data[34 + i] = i.toByte()
 
-		val result = ResponseParser.parse(data)
-		assertIs<Response.ChannelInfo>(result)
-		assertEquals(2, result.index)
-		assertEquals("General", result.name)
-	}
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals(2, result.index)
+        assertEquals("General", result.name)
+        assertEquals("000102030405060708090a0b0c0d0e0f", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_withoutSecret_returnsEmptySecret() {
+        val data = ByteArray(34)
+        data[0] = 0x12
+        data[1] = 0x02
+        "General".encodeToByteArray().copyInto(data, 2)
+
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_shortResponse_returnsEmptySecret() {
+        val result = ResponseParser.parse(byteArrayOf(0x12, 0x02))
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
 
 	@Test
 	fun parse_messageSent() {
@@ -661,10 +682,12 @@ class ResponseParserTest {
 
 	@Test
 	fun parse_telemetryResponse() {
-		val data = ByteArray(10)
+		// Firmware frame: [0x8B][reserved 0x00][6-byte prefix][telemetry data]
+		val data = ByteArray(11)
 		data[0] = 0x8B.toByte()
-		for (i in 1..6) data[i] = i.toByte()
-		data[7] = 0xDE.toByte(); data[8] = 0xAD.toByte(); data[9] = 0xBE.toByte()
+		data[1] = 0x00 // reserved byte
+		byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06).copyInto(data, 2)
+		data[8] = 0xDE.toByte(); data[9] = 0xAD.toByte(); data[10] = 0xBE.toByte()
 		val result = ResponseParser.parse(data)
 		assertIs<Response.TelemetryResponse>(result)
 		assertEquals("010203040506", result.publicKeyPrefix)

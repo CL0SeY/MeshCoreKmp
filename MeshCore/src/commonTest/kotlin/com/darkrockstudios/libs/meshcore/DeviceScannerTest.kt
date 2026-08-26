@@ -2,12 +2,18 @@
 
 package com.darkrockstudios.libs.meshcore
 
+import com.darkrockstudios.libs.meshcore.ble.ConnectionState
 import com.darkrockstudios.libs.meshcore.ble.DiscoveredDevice
+import com.darkrockstudios.libs.meshcore.ble.MeshCoreBleException
 import com.darkrockstudios.libs.meshcore.ble.ScanFilter
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -106,4 +112,61 @@ class DeviceScannerTest {
 		assertTrue(adapter.scanStarted)
 		scanner.stopScan()
 	}
+
+	@Test
+	fun connect_releasesGattWhenMtuFails() = runTest {
+		val bleConnection = FakeBleConnection().apply {
+			mtuFailure = MeshCoreBleException("MTU request failed with status: 4")
+		}
+		val scanner = DeviceScanner(FakeBleAdapter(bleConnection))
+
+		assertFailsWith<MeshCoreBleException> {
+			scanner.connect(sampleDevice, backgroundScope, handshakeOffConfig())
+		}
+
+		assertEquals(1, bleConnection.disconnectCount)
+		assertEquals(ConnectionState.Disconnected, bleConnection.connectionState.value)
+	}
+
+	@Test
+	fun connect_releasesGattWhenHandshakeTimesOut() = runTest {
+		val bleConnection = FakeBleConnection()
+		val scanner = DeviceScanner(FakeBleAdapter(bleConnection))
+
+		assertFailsWith<MeshCoreException.CommandTimeout> {
+			scanner.connect(
+				sampleDevice,
+				backgroundScope,
+				handshakeOffConfig().copy(commandTimeoutSeconds = 1),
+			)
+		}
+
+		assertEquals(1, bleConnection.disconnectCount)
+		assertEquals(ConnectionState.Disconnected, bleConnection.connectionState.value)
+	}
+
+	@Test
+	fun connect_releasesGattWhenCancelledAfterConnect() = runTest {
+		val bleConnection = FakeBleConnection().apply { hangMtu = true }
+		val scanner = DeviceScanner(FakeBleAdapter(bleConnection))
+
+		val job = launch(start = CoroutineStart.UNDISPATCHED) {
+			scanner.connect(sampleDevice, backgroundScope, handshakeOffConfig())
+		}
+		assertTrue(job.isActive)
+
+		job.cancelAndJoin()
+
+		assertEquals(1, bleConnection.disconnectCount)
+		assertEquals(ConnectionState.Disconnected, bleConnection.connectionState.value)
+	}
+
+	private fun handshakeOffConfig() = ConnectionConfig(
+		autoSyncTime = false,
+		autoFetchContacts = false,
+		autoFetchChannels = false,
+		autoPollMessages = false,
+	)
+
+	private val sampleDevice = DiscoveredDevice("dev1", "Radio A", -50)
 }
