@@ -3,6 +3,7 @@ package com.darkrockstudios.libs.meshcore
 import com.darkrockstudios.libs.meshcore.ble.BleConnection
 import com.darkrockstudios.libs.meshcore.ble.ConnectionPriority
 import com.darkrockstudios.libs.meshcore.ble.ConnectionState
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -19,12 +20,17 @@ class FakeBleConnection : BleConnection {
 	override val deviceIdentifier: String = "fake-device-001"
 
 	var negotiatedMtu: Int = 23
+	var disconnectCount: Int = 0
+	var mtuFailure: Throwable? = null
+	var hangMtu: Boolean = false
 
 	override suspend fun write(data: ByteArray) {
 		writtenData.add(data.copyOf())
 	}
 
 	override suspend fun requestMtu(mtu: Int): Int {
+		mtuFailure?.let { throw it }
+		if (hangMtu) awaitCancellation()
 		negotiatedMtu = mtu
 		return mtu
 	}
@@ -32,6 +38,7 @@ class FakeBleConnection : BleConnection {
 	override suspend fun requestConnectionPriority(priority: ConnectionPriority): Boolean = true
 
 	override suspend fun disconnect() {
+		disconnectCount++
 		_connectionState.value = ConnectionState.Disconnected
 	}
 
