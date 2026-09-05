@@ -111,17 +111,7 @@ object CommandSerializer {
 
 	fun addContact(publicKey: ByteArray, name: String, type: Int = 0, flags: Int = 0): ByteArray {
 		require(publicKey.size == 32) { "Public key must be 32 bytes" }
-		val nameBytes = name.encodeToByteArray()
-		// 1 cmd + 32 key + 1 type + 1 flags + 64 path + 32 name = 131
-		val buffer = ByteArray(131)
-		buffer[0] = CommandCode.ADD_UPDATE_CONTACT.toByte()
-		publicKey.copyInto(buffer, 1)
-		buffer[33] = type.toByte()
-		buffer[34] = flags.toByte()
-		// bytes 35-98: out_path (64 bytes, zeros = no path)
-		// bytes 99-130: name (32 bytes)
-		nameBytes.copyInto(buffer, 99, 0, minOf(nameBytes.size, 32))
-		return buffer
+		return updateContact(publicKey, name, type, flags)
 	}
 
 	fun updateContact(
@@ -129,19 +119,67 @@ object CommandSerializer {
 		name: String,
 		type: Int,
 		flags: Int,
-		outPath: ByteArray = ByteArray(64),
+		outPath: ByteArray = ByteArray(0),
+		outPathLen: Int = 0,
+		outPathHashMode: Int = 0,
+		lastAdvertTimestamp: Long = 0,
+		gpsLatitude: Double? = null,
+		gpsLongitude: Double? = null,
 	): ByteArray {
 		require(publicKey.size == 32) { "Public key must be 32 bytes" }
 		require(outPath.size <= 64) { "Path must be <= 64 bytes" }
-		val nameBytes = name.encodeToByteArray()
-		val buffer = ByteArray(131)
+		// 1 cmd + 32 key + 1 type + 1 flags + 1 path_len + 64 path + 32 name
+		// + 4 last_advert + 4 lat + 4 lon = 144. The path_len byte MUST be
+		// present: without it the name lands one byte early and the node
+		// stores name[1:], visibly eating the first character.
+		val buffer = ByteArray(144)
 		buffer[0] = CommandCode.ADD_UPDATE_CONTACT.toByte()
 		publicKey.copyInto(buffer, 1)
 		buffer[33] = type.toByte()
 		buffer[34] = flags.toByte()
-		outPath.copyInto(buffer, 35, 0, minOf(outPath.size, 64))
-		nameBytes.copyInto(buffer, 99, 0, minOf(nameBytes.size, 32))
+		buffer[35] =
+			if (outPathLen < 0) {
+				0xFF.toByte()
+			} else {
+				((outPathLen and 0x3F) or (outPathHashMode shl 6)).toByte()
+			}
+		// bytes 36-99: out_path (64 bytes, zero-padded past the real path)
+		outPath.copyInto(buffer, 36, 0, minOf(outPath.size, 64))
+		// bytes 100-131: name (32 bytes, cut on a UTF-8 boundary so a long
+		// emoji name degrades to a shorter name, never to U+FFFD garbage)
+		val nameBytes = truncateUtf8(name.encodeToByteArray(), 32)
+		nameBytes.copyInto(buffer, 100)
+		putUInt32LE(buffer, 132, lastAdvertTimestamp)
+		putInt32LE(buffer, 136, gpsLatitude?.times(1_000_000)?.toInt() ?: 0)
+		putInt32LE(buffer, 140, gpsLongitude?.times(1_000_000)?.toInt() ?: 0)
 		return buffer
+	}
+
+	/**
+	 * Cuts UTF-8 [bytes] to at most [maxLength] bytes without splitting a
+	 * multi-byte sequence: a trailing partial sequence is dropped whole, so
+	 * decoding the result never yields U+FFFD replacement characters.
+	 */
+	internal fun truncateUtf8(bytes: ByteArray, maxLength: Int): ByteArray {
+		if (bytes.size <= maxLength) return bytes
+		var end = maxLength
+		// Step back over continuation bytes to the sequence's lead byte.
+		while (end > 0 && bytes[end - 1] in 0x80.toByte()..0xBF.toByte()) end--
+		if (end == 0) return ByteArray(0)
+		val lead = bytes[end - 1].toInt() and 0xFF
+		val expected =
+			when {
+				lead < 0x80 -> 1
+				lead < 0xE0 -> 2
+				lead < 0xF0 -> 3
+				else -> 4
+			}
+		// Keep the sequence only when it fits whole.
+		return if (end - 1 + expected <= maxLength) {
+			bytes.copyOfRange(0, maxLength)
+		} else {
+			bytes.copyOfRange(0, end - 1)
+		}
 	}
 
 	fun removeContact(publicKey: ByteArray): ByteArray {

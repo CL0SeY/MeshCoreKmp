@@ -251,13 +251,86 @@ class CommandSerializerTest {
 	fun addContact_correctLayout() {
 		val publicKey = ByteArray(32) { it.toByte() }
 		val result = CommandSerializer.addContact(publicKey, "Alice", type = 1, flags = 2)
-		assertEquals(131, result.size)
+		// 1 cmd + 32 key + 1 type + 1 flags + 1 path_len + 64 path + 32 name
+		// + 4 last_advert + 4 lat + 4 lon = 144
+		assertEquals(144, result.size)
 		assertEquals(0x09.toByte(), result[0])
 		assertEquals(0x00.toByte(), result[1]) // first byte of key
 		assertEquals(0x1F.toByte(), result[32]) // last byte of key
 		assertEquals(0x01.toByte(), result[33]) // type
 		assertEquals(0x02.toByte(), result[34]) // flags
-		assertEquals('A'.code.toByte(), result[99]) // name start
+		assertEquals(0x00.toByte(), result[35]) // path_len = 0, no path
+		assertEquals('A'.code.toByte(), result[100]) // name start
+	}
+
+	@Test
+	fun updateContact_echoesPathAndAdvertFields() {
+		val publicKey = ByteArray(32) { it.toByte() }
+		val path = byteArrayOf(0x0A, 0x0B, 0x0C)
+		val result =
+			CommandSerializer.updateContact(
+				publicKey = publicKey,
+				name = "🐼 Al",
+				type = 0,
+				flags = 1,
+				outPath = path,
+				outPathLen = 3,
+				outPathHashMode = 1,
+				lastAdvertTimestamp = 1_700_000_000L,
+				gpsLatitude = 48.85837,
+				gpsLongitude = 2.294481,
+			)
+		assertEquals(144, result.size)
+		// path_len byte packs len (low 6 bits) + hash mode (high 2 bits)
+		assertEquals((3 or (1 shl 6)).toByte(), result[35])
+		assertEquals(0x0A.toByte(), result[36])
+		assertEquals(0x0C.toByte(), result[38])
+		assertEquals(0x00.toByte(), result[39]) // zero-padded past the path
+		// emoji name lands byte-intact at offset 100
+		val nameBytes = "🐼 Al".encodeToByteArray()
+		assertEquals(7, nameBytes.size)
+		for (i in nameBytes.indices) {
+			assertEquals(nameBytes[i], result[100 + i])
+		}
+		assertEquals(0x00.toByte(), result[107]) // zero-padded past the name
+		// trailing advert fields round-trip through the response parser layout
+		assertEquals(1_700_000_000L, ResponseParser.getUInt32LE(result, 132))
+		assertEquals((48.85837 * 1_000_000).toInt(), ResponseParser.getInt32LE(result, 136))
+		assertEquals((2.294481 * 1_000_000).toInt(), ResponseParser.getInt32LE(result, 140))
+	}
+
+	@Test
+	fun updateContact_floodPathEncodes255() {
+		val publicKey = ByteArray(32) { it.toByte() }
+		val result =
+			CommandSerializer.updateContact(
+				publicKey = publicKey,
+				name = "Bob",
+				type = 0,
+				flags = 0,
+				outPathLen = -1,
+				outPathHashMode = -1,
+			)
+		assertEquals(0xFF.toByte(), result[35])
+		assertEquals('B'.code.toByte(), result[100])
+	}
+
+	@Test
+	fun truncateUtf8_keepsWholeSequencesOnly() {
+		// 29 ASCII bytes + panda (4 bytes) = 33 bytes; cut at 32 must drop
+		// the whole panda, not leave 3 dangling bytes behind.
+		val over = ("x".repeat(29) + "🐼").encodeToByteArray()
+		assertEquals(33, over.size)
+		val cut = CommandSerializer.truncateUtf8(over, 32)
+		assertEquals(29, cut.size)
+		assertEquals("x".repeat(29), cut.decodeToString())
+		// Exact fit is untouched.
+		val exact = "🐼 Al".encodeToByteArray()
+		assertEquals(exact.toList(), CommandSerializer.truncateUtf8(exact, 32).toList())
+		// Pure ASCII cuts mid-string cleanly.
+		assertEquals("abc", "abcdef".encodeToByteArray().let {
+			CommandSerializer.truncateUtf8(it, 3).decodeToString()
+		})
 	}
 
 	@Test

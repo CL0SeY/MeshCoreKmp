@@ -341,10 +341,26 @@ class DeviceConnection internal constructor(
 		name: String,
 		type: Int,
 		flags: Int,
-		outPath: ByteArray = ByteArray(64),
+		outPath: ByteArray = ByteArray(0),
+		outPathLen: Int = 0,
+		outPathHashMode: Int = 0,
+		lastAdvertTimestamp: Long = 0,
+		gpsLatitude: Double? = null,
+		gpsLongitude: Double? = null,
 	) {
 		commandQueue.execute<Response.Ok>(
-			CommandSerializer.updateContact(publicKey, name, type, flags, outPath),
+			CommandSerializer.updateContact(
+				publicKey,
+				name,
+				type,
+				flags,
+				outPath,
+				outPathLen,
+				outPathHashMode,
+				lastAdvertTimestamp,
+				gpsLatitude,
+				gpsLongitude,
+			),
 			config.commandTimeout,
 		)
 	}
@@ -901,6 +917,9 @@ class DeviceConnection internal constructor(
 			name = name,
 			type = type,
 			flags = flags,
+			outPath = outPath,
+			outPathLen = outPathLen,
+			outPathHashMode = outPathHashMode,
 			lastAdvertTimestamp = lastAdvertTimestamp,
 			gpsLatitude = gpsLatitude,
 			gpsLongitude = gpsLongitude,

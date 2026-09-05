@@ -330,6 +330,43 @@ class ResponseParserTest {
 	}
 
 	@Test
+	fun parse_contactRoundTrip_preservesEmojiNameAndPath() {
+		// Regression net for the eaten-panda bug: the 0x09 write frame used
+		// to omit the path_len byte, so the node stored name[1:] (the panda's
+		// F0 went missing, leaving 3x U+FFFD). A frame built by the fixed
+		// serializer must parse back byte-identical through the 0x03 layout.
+		val publicKey = ByteArray(32) { it.toByte() }
+		val path = byteArrayOf(0x0A, 0x0B, 0x0C)
+		val frame =
+			CommandSerializer.updateContact(
+				publicKey = publicKey,
+				name = "🐼 closey mobile",
+				type = 0,
+				flags = 1,
+				outPath = path,
+				outPathLen = 3,
+				outPathHashMode = 0,
+				lastAdvertTimestamp = 1_700_000_000L,
+				gpsLatitude = 48.85837,
+				gpsLongitude = 2.294481,
+			)
+		// Re-tag as a 0x03 contact response and parse.
+		val data = frame.copyOf()
+		data[0] = 0x03
+		val result = ResponseParser.parse(data)
+		assertIs<Response.Contact>(result)
+		assertEquals("🐼 closey mobile", result.name)
+		assertEquals(3, result.outPathLen)
+		assertEquals(0, result.outPathHashMode)
+		assertEquals(path.toList(), result.outPath.toList())
+		assertEquals(1, result.flags)
+		assertEquals(1_700_000_000L, result.lastAdvertTimestamp)
+		// Double x1e6 truncation is lossy at the 1e-9 level; compare loosely.
+		assertEquals(48.85837, result.gpsLatitude ?: 0.0, 0.000001)
+		assertEquals(2.294481, result.gpsLongitude ?: 0.0, 0.000001)
+	}
+
+	@Test
 	fun parse_contactEnd() {
 		val data = byteArrayOf(0x04)
 		val result = ResponseParser.parse(data)

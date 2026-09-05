@@ -185,8 +185,23 @@ object ResponseParser {
 		val publicKey = data.copyOfRange(1, 33)
 		val contactType = data[33].toInt() and 0xFF
 		val flags = data[34].toInt() and 0xFF
-		val outPathLen = data[35].toInt() // signed
-		// bytes 36-99: out_path (64 bytes) — skipped
+		// Path-length byte: 255 (0xFF) = flood/signed contact; otherwise the
+		// low 6 bits are the path length and the high 2 the hash mode.
+		val pathLenByte = data[35].toUByte().toInt()
+		val isFloodPath = pathLenByte == 255
+		val outPathHashMode = if (isFloodPath) -1 else pathLenByte shr 6
+		val outPathLen = if (isFloodPath) -1 else pathLenByte and 0x3F
+		// bytes 36-99: out_path (64 bytes, fixed field, NUL-padded past the
+		// real path). Keep the occupied bytes so a contact write-back echoes
+		// the routing path instead of zeroing it.
+		val pathUsed =
+			if (outPathLen > 0) {
+				minOf(outPathLen * (outPathHashMode + 1), 64)
+			} else {
+				0
+			}
+		val outPath =
+			if (pathUsed > 0) data.copyOfRange(36, 36 + pathUsed) else ByteArray(0)
 		val name = extractString(data, 100, 32)
 
 		val lastAdvertTimestamp = if (data.size >= 136) getUInt32LE(data, 132) else 0L
@@ -201,6 +216,8 @@ object ResponseParser {
 			type = contactType,
 			flags = flags,
 			outPathLen = outPathLen,
+			outPath = outPath,
+			outPathHashMode = outPathHashMode,
 			name = name,
 			lastAdvertTimestamp = lastAdvertTimestamp,
 			gpsLatitude = gpsLat,
