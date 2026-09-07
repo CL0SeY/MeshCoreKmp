@@ -472,4 +472,58 @@ class DeviceConnectionTest {
 
 		collectJob.cancel()
 	}
+
+	@Test
+	fun messagesWaitingDrainTimeoutKeepsListenerAlive() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		val initJob = launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		initJob.cancel()
+		testScheduler.advanceUntilIdle()
+		val baseWrites = bleConnection.writtenData.size
+
+		// A MessagesWaiting push whose GET_MESSAGE is never answered: the
+		// 10s command timeout must drop this drain, not the listener. (On a
+		// host scope this throw used to kill the process on the main thread.)
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		testScheduler.advanceUntilIdle()
+		testScheduler.advanceTimeBy(11_000)
+		testScheduler.runCurrent()
+
+		// A second push still triggers a fresh drain read: the listener
+		// survived the first timeout.
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		testScheduler.advanceUntilIdle()
+		testScheduler.advanceTimeBy(60_000)
+		testScheduler.advanceUntilIdle()
+		val getMessageWrites =
+			bleConnection.writtenData
+				.drop(baseWrites)
+				.count { it.size == 1 && it[0] == 0x0A.toByte() }
+		assertEquals(2, getMessageWrites)
+	}
 }
