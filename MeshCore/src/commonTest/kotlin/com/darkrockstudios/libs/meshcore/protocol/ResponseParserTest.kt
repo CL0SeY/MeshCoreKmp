@@ -340,7 +340,7 @@ class ResponseParserTest {
 		val frame =
 			CommandSerializer.updateContact(
 				publicKey = publicKey,
-				name = "🐼 closey mobile",
+				name = "🐼 test node",
 				type = 0,
 				flags = 1,
 				outPath = path,
@@ -355,7 +355,7 @@ class ResponseParserTest {
 		data[0] = 0x03
 		val result = ResponseParser.parse(data)
 		assertIs<Response.Contact>(result)
-		assertEquals("🐼 closey mobile", result.name)
+		assertEquals("🐼 test node", result.name)
 		assertEquals(3, result.outPathLen)
 		assertEquals(0, result.outPathHashMode)
 		assertEquals(path.toList(), result.outPath.toList())
