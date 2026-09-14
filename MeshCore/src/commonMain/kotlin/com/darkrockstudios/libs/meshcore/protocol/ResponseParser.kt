@@ -174,7 +174,8 @@ object ResponseParser {
 		if (data.size < 2) return null
 		val index = data[1].toInt() and 0xFF
 		val name = if (data.size >= 34) extractString(data, 2, 32) else ""
-		return Response.ChannelInfo(index = index, name = name)
+		val secret = if (data.size >= 50) data.copyOfRange(34, 50).toHexString() else ""
+		return Response.ChannelInfo(index = index, name = name, secret = secret)
 	}
 
 	private fun parseContact(data: ByteArray): Response.Contact? {
@@ -184,8 +185,23 @@ object ResponseParser {
 		val publicKey = data.copyOfRange(1, 33)
 		val contactType = data[33].toInt() and 0xFF
 		val flags = data[34].toInt() and 0xFF
-		val outPathLen = data[35].toInt() // signed
-		// bytes 36-99: out_path (64 bytes) — skipped
+		// Path-length byte: 255 (0xFF) = flood/signed contact; otherwise the
+		// low 6 bits are the path length and the high 2 the hash mode.
+		val pathLenByte = data[35].toUByte().toInt()
+		val isFloodPath = pathLenByte == 255
+		val outPathHashMode = if (isFloodPath) -1 else pathLenByte shr 6
+		val outPathLen = if (isFloodPath) -1 else pathLenByte and 0x3F
+		// bytes 36-99: out_path (64 bytes, fixed field, NUL-padded past the
+		// real path). Keep the occupied bytes so a contact write-back echoes
+		// the routing path instead of zeroing it.
+		val pathUsed =
+			if (outPathLen > 0) {
+				minOf(outPathLen * (outPathHashMode + 1), 64)
+			} else {
+				0
+			}
+		val outPath =
+			if (pathUsed > 0) data.copyOfRange(36, 36 + pathUsed) else ByteArray(0)
 		val name = extractString(data, 100, 32)
 
 		val lastAdvertTimestamp = if (data.size >= 136) getUInt32LE(data, 132) else 0L
@@ -200,6 +216,8 @@ object ResponseParser {
 			type = contactType,
 			flags = flags,
 			outPathLen = outPathLen,
+			outPath = outPath,
+			outPathHashMode = outPathHashMode,
 			name = name,
 			lastAdvertTimestamp = lastAdvertTimestamp,
 			gpsLatitude = gpsLat,
@@ -424,8 +442,10 @@ object ResponseParser {
 	}
 
 	private fun parseTelemetryResponse(data: ByteArray): Response.TelemetryResponse {
-		val prefix = if (data.size >= 7) data.copyOfRange(1, 7).toHexString() else ""
-		val telemetryData = if (data.size > 7) data.copyOfRange(7, data.size) else ByteArray(0)
+		// Wire frame (firmware MyMesh.cpp, meshcore.js, meshcore_py):
+		// [0x8B][reserved 0x00][6-byte public-key prefix][CayenneLPP payload]
+		val prefix = if (data.size >= 8) data.copyOfRange(2, 8).toHexString() else ""
+		val telemetryData = if (data.size > 8) data.copyOfRange(8, data.size) else ByteArray(0)
 		return Response.TelemetryResponse(prefix, telemetryData)
 	}
 

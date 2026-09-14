@@ -127,18 +127,39 @@ class ResponseParserTest {
 		assertEquals("", result.model)
 	}
 
-	@Test
-	fun parse_channelInfo() {
-		val data = ByteArray(34)
-		data[0] = 0x12
-		data[1] = 0x02 // channel index 2
-		"General".encodeToByteArray().copyInto(data, 2)
+    @Test
+    fun parse_channelInfo() {
+        val data = ByteArray(50)
+        data[0] = 0x12
+        data[1] = 0x02 // channel index 2
+        "General".encodeToByteArray().copyInto(data, 2)
+        for (i in 0 until 16) data[34 + i] = i.toByte()
 
-		val result = ResponseParser.parse(data)
-		assertIs<Response.ChannelInfo>(result)
-		assertEquals(2, result.index)
-		assertEquals("General", result.name)
-	}
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals(2, result.index)
+        assertEquals("General", result.name)
+        assertEquals("000102030405060708090a0b0c0d0e0f", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_withoutSecret_returnsEmptySecret() {
+        val data = ByteArray(34)
+        data[0] = 0x12
+        data[1] = 0x02
+        "General".encodeToByteArray().copyInto(data, 2)
+
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_shortResponse_returnsEmptySecret() {
+        val result = ResponseParser.parse(byteArrayOf(0x12, 0x02))
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
 
 	@Test
 	fun parse_messageSent() {
@@ -306,6 +327,43 @@ class ResponseParserTest {
 		val data = byteArrayOf(0x02)
 		val result = ResponseParser.parse(data)
 		assertIs<Response.ContactStart>(result)
+	}
+
+	@Test
+	fun parse_contactRoundTrip_preservesEmojiNameAndPath() {
+		// Regression net for the eaten-panda bug: the 0x09 write frame used
+		// to omit the path_len byte, so the node stored name[1:] (the panda's
+		// F0 went missing, leaving 3x U+FFFD). A frame built by the fixed
+		// serializer must parse back byte-identical through the 0x03 layout.
+		val publicKey = ByteArray(32) { it.toByte() }
+		val path = byteArrayOf(0x0A, 0x0B, 0x0C)
+		val frame =
+			CommandSerializer.updateContact(
+				publicKey = publicKey,
+				name = "🐼 test node",
+				type = 0,
+				flags = 1,
+				outPath = path,
+				outPathLen = 3,
+				outPathHashMode = 0,
+				lastAdvertTimestamp = 1_700_000_000L,
+				gpsLatitude = 48.85837,
+				gpsLongitude = 2.294481,
+			)
+		// Re-tag as a 0x03 contact response and parse.
+		val data = frame.copyOf()
+		data[0] = 0x03
+		val result = ResponseParser.parse(data)
+		assertIs<Response.Contact>(result)
+		assertEquals("🐼 test node", result.name)
+		assertEquals(3, result.outPathLen)
+		assertEquals(0, result.outPathHashMode)
+		assertEquals(path.toList(), result.outPath.toList())
+		assertEquals(1, result.flags)
+		assertEquals(1_700_000_000L, result.lastAdvertTimestamp)
+		// Double x1e6 truncation is lossy at the 1e-9 level; compare loosely.
+		assertEquals(48.85837, result.gpsLatitude ?: 0.0, 0.000001)
+		assertEquals(2.294481, result.gpsLongitude ?: 0.0, 0.000001)
 	}
 
 	@Test
@@ -661,10 +719,12 @@ class ResponseParserTest {
 
 	@Test
 	fun parse_telemetryResponse() {
-		val data = ByteArray(10)
+		// Firmware frame: [0x8B][reserved 0x00][6-byte prefix][telemetry data]
+		val data = ByteArray(11)
 		data[0] = 0x8B.toByte()
-		for (i in 1..6) data[i] = i.toByte()
-		data[7] = 0xDE.toByte(); data[8] = 0xAD.toByte(); data[9] = 0xBE.toByte()
+		data[1] = 0x00 // reserved byte
+		byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06).copyInto(data, 2)
+		data[8] = 0xDE.toByte(); data[9] = 0xAD.toByte(); data[10] = 0xBE.toByte()
 		val result = ResponseParser.parse(data)
 		assertIs<Response.TelemetryResponse>(result)
 		assertEquals("010203040506", result.publicKeyPrefix)

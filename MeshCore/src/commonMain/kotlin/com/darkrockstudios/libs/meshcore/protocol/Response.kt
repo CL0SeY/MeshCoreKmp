@@ -44,6 +44,7 @@ sealed class Response {
 	data class ChannelInfo(
 		val index: Int,
 		val name: String,
+		val secret: String = "",
 	) : Response()
 
 	data object ContactStart : Response()
@@ -53,6 +54,8 @@ sealed class Response {
 		val type: Int,
 		val flags: Int,
 		val outPathLen: Int,
+		val outPath: ByteArray = ByteArray(0),
+		val outPathHashMode: Int = 0,
 		val name: String,
 		val lastAdvertTimestamp: Long,
 		val gpsLatitude: Double?,
@@ -68,11 +71,13 @@ sealed class Response {
 			if (type != other.type) return false
 			if (flags != other.flags) return false
 			if (outPathLen != other.outPathLen) return false
+			if (outPathHashMode != other.outPathHashMode) return false
 			if (lastAdvertTimestamp != other.lastAdvertTimestamp) return false
 			if (gpsLatitude != other.gpsLatitude) return false
 			if (gpsLongitude != other.gpsLongitude) return false
 			if (lastmod != other.lastmod) return false
 			if (!publicKey.contentEquals(other.publicKey)) return false
+			if (!outPath.contentEquals(other.outPath)) return false
 			if (name != other.name) return false
 
 			return true
@@ -82,11 +87,13 @@ sealed class Response {
 			var result = type
 			result = 31 * result + flags
 			result = 31 * result + outPathLen
+			result = 31 * result + outPathHashMode
 			result = 31 * result + lastAdvertTimestamp.hashCode()
 			result = 31 * result + (gpsLatitude?.hashCode() ?: 0)
 			result = 31 * result + (gpsLongitude?.hashCode() ?: 0)
 			result = 31 * result + lastmod.hashCode()
 			result = 31 * result + publicKey.contentHashCode()
+			result = 31 * result + outPath.contentHashCode()
 			result = 31 * result + name.hashCode()
 			return result
 		}

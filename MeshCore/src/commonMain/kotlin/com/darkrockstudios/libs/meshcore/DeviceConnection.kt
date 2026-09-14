@@ -6,6 +6,8 @@ import com.darkrockstudios.libs.meshcore.model.*
 import com.darkrockstudios.libs.meshcore.protocol.CommandQueue
 import com.darkrockstudios.libs.meshcore.protocol.CommandSerializer
 import com.darkrockstudios.libs.meshcore.protocol.Response
+import io.github.aakira.napier.Napier
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -67,6 +69,9 @@ class DeviceConnection internal constructor(
 	val traceData: Flow<Response.TraceData> = commandQueue.pushEvents
 		.filterIsInstance<Response.TraceData>()
 
+	val logData: Flow<Response.LogData> = commandQueue.pushEvents
+		.filterIsInstance<Response.LogData>()
+
 	val newAdverts: Flow<Response.NewAdvert> = commandQueue.pushEvents
 		.filterIsInstance<Response.NewAdvert>()
 
@@ -121,7 +126,19 @@ class DeviceConnection internal constructor(
 		scope.launch {
 			commandQueue.pushEvents
 				.filterIsInstance<Response.MessagesWaiting>()
-				.collect { drainMessages() }
+				.collect {
+					// A stalled GET_MESSAGE (10s command timeout) must drop
+					// this drain, never the scope: the scope belongs to the
+					// host app (main thread on Android), where an uncaught
+					// throw kills the process and eats later pushes.
+					try {
+						drainMessages()
+					} catch (cancelled: CancellationException) {
+						throw cancelled
+					} catch (error: Exception) {
+						Napier.w(tag = TAG) { "message drain failed: ${error.message}" }
+					}
+				}
 		}
 	}
 
@@ -151,7 +168,7 @@ class DeviceConnection internal constructor(
 			CommandSerializer.getChannel(index),
 			config.commandTimeout,
 		)
-		return Channel(index = resp.index, name = resp.name)
+		return Channel(index = resp.index, name = resp.name, secret = resp.secret)
 	}
 
 	suspend fun getAllChannels(): List<Channel> {
@@ -191,11 +208,16 @@ class DeviceConnection internal constructor(
 
 	// --- Messaging ---
 
-	suspend fun sendDirectMessage(publicKeyPrefix: ByteArray, text: String): MessageSentConfirmation {
+	suspend fun sendDirectMessage(
+		publicKeyPrefix: ByteArray,
+		text: String,
+		timestampSeconds: Long? = null,
+		attempt: Int = 0,
+	): MessageSentConfirmation {
 		require(publicKeyPrefix.size == 6) { "Public key prefix must be 6 bytes" }
-		val timestamp = currentTimeSeconds()
+		val timestamp = timestampSeconds ?: currentTimeSeconds()
 		val resp = commandQueue.execute<Response>(
-			CommandSerializer.sendDirectMessage(publicKeyPrefix, text, timestamp),
+			CommandSerializer.sendDirectMessage(publicKeyPrefix, text, timestamp, attempt),
 			config.commandTimeout,
 		)
 		return when (resp) {
@@ -217,8 +239,12 @@ class DeviceConnection internal constructor(
 		}
 	}
 
-	suspend fun sendChannelMessage(channelIndex: Int, text: String): MessageSentConfirmation {
-		val timestamp = currentTimeSeconds()
+	suspend fun sendChannelMessage(
+		channelIndex: Int,
+		text: String,
+		timestampSeconds: Long? = null,
+	): MessageSentConfirmation {
+		val timestamp = timestampSeconds ?: currentTimeSeconds()
 		val resp = commandQueue.execute<Response>(
 			CommandSerializer.sendChannelMessage(channelIndex, text, timestamp),
 			config.commandTimeout,
@@ -334,10 +360,26 @@ class DeviceConnection internal constructor(
 		name: String,
 		type: Int,
 		flags: Int,
-		outPath: ByteArray = ByteArray(64),
+		outPath: ByteArray = ByteArray(0),
+		outPathLen: Int = 0,
+		outPathHashMode: Int = 0,
+		lastAdvertTimestamp: Long = 0,
+		gpsLatitude: Double? = null,
+		gpsLongitude: Double? = null,
 	) {
 		commandQueue.execute<Response.Ok>(
-			CommandSerializer.updateContact(publicKey, name, type, flags, outPath),
+			CommandSerializer.updateContact(
+				publicKey,
+				name,
+				type,
+				flags,
+				outPath,
+				outPathLen,
+				outPathHashMode,
+				lastAdvertTimestamp,
+				gpsLatitude,
+				gpsLongitude,
+			),
 			config.commandTimeout,
 		)
 	}
@@ -894,6 +936,9 @@ class DeviceConnection internal constructor(
 			name = name,
 			type = type,
 			flags = flags,
+			outPath = outPath,
+			outPathLen = outPathLen,
+			outPathHashMode = outPathHashMode,
 			lastAdvertTimestamp = lastAdvertTimestamp,
 			gpsLatitude = gpsLatitude,
 			gpsLongitude = gpsLongitude,
@@ -950,4 +995,8 @@ class DeviceConnection internal constructor(
 
 	private fun currentTimeSeconds(): Long =
 		kotlin.time.Clock.System.now().epochSeconds
+
+	companion object {
+		private const val TAG = "MeshCoreBLE"
+	}
 }
