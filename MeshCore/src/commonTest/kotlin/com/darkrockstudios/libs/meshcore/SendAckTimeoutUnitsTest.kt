@@ -33,6 +33,9 @@ class SendAckTimeoutUnitsTest {
 		return resp
 	}
 
+	private fun ackResponse(): ByteArray =
+		byteArrayOf(0x82.toByte(), 0x0A, 0x0B, 0x0C, 0x0D)
+
 	@Test
 	fun ackWaitHonoursTheNodesMillisecondTimeout() = runTest {
 		val bleConnection = FakeBleConnection()
@@ -104,6 +107,42 @@ class SendAckTimeoutUnitsTest {
 		assertTrue(
 			waitedMillis == 120_000L,
 			"garbled estimate waited ${waitedMillis}ms instead of the 120000ms bound",
+		)
+	}
+
+	@Test
+	fun immediateAckResolvesWithoutWaitingTheSuggestedTimeout() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(connection = bleConnection, scope = backgroundScope)
+		testScheduler.advanceUntilIdle()
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = ConnectionConfig(
+				autoSyncTime = false,
+				autoFetchContacts = false,
+				autoFetchChannels = false,
+				autoPollMessages = false,
+			),
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { yield() }
+			bleConnection.simulateResponse(messageSentResponse(5_300))
+			bleConnection.simulateResponse(ackResponse())
+		}
+
+		val start = testScheduler.currentTime
+		val result = connection.sendAndAwaitAck {
+			sendDirectMessage(ByteArray(6) { it.toByte() }, "ping")
+		}
+		val waitedMillis = testScheduler.currentTime - start
+
+		assertTrue(result.isSuccess, "expected an immediate ACK, got $result")
+		assertTrue(
+			waitedMillis == 0L,
+			"immediate ACK waited ${waitedMillis}ms instead of returning at 0",
 		)
 	}
 }

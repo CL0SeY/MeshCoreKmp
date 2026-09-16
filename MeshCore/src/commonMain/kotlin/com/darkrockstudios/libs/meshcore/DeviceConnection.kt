@@ -9,9 +9,12 @@ import com.darkrockstudios.libs.meshcore.protocol.Response
 import io.github.aakira.napier.Napier
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.channels.Channel as CoroutineChannel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
 
 /**
  * Upper bound on a single ACK wait. The node's estimate arrives as a raw
@@ -944,12 +947,19 @@ class DeviceConnection internal constructor(
 	suspend fun sendAndAwaitAck(
 		block: suspend DeviceConnection.() -> MessageSentConfirmation,
 	): Result<MessageSentConfirmation> {
-		// Buffer acks before sending so we don't miss fast responses
+		// Buffer acks before sending so we don't miss fast responses.
+		// UNDISPATCHED subscribes before [block] runs. A Channel — not a
+		// second SharedFlow collector — keeps an ACK that arrived while
+		// MSG_SENT was still nested in CommandQueue's incoming collector.
 		val receivedAcks = mutableSetOf<String>()
-		val collectorJob = scope.launch {
+		val arrivals = CoroutineChannel<String>(CoroutineChannel.UNLIMITED)
+		val collectorJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
 			commandQueue.pushEvents
 				.filterIsInstance<Response.Ack>()
-				.collect { receivedAcks.add(it.ackCode) }
+				.collect {
+					receivedAcks.add(it.ackCode)
+					arrivals.trySend(it.ackCode)
+				}
 		}
 
 		try {
@@ -957,7 +967,11 @@ class DeviceConnection internal constructor(
 
 			if (confirmation.expectedAck.isEmpty()) return Result.success(confirmation)
 
-			// Check if ack already arrived while sending
+			// MSG_SENT and the ACK push are often one BLE burst. Yield so
+			// CommandQueue can finish routing the ACK before we decide it
+			// missed and wait the node's full suggested timeout.
+			yield()
+
 			if (confirmation.expectedAck in receivedAcks) return Result.success(confirmation)
 
 			val timeoutMs = if (confirmation.suggestedTimeoutMillis > 0) {
@@ -971,11 +985,14 @@ class DeviceConnection internal constructor(
 				config.commandTimeout.inWholeMilliseconds
 			}
 
-			// Wait for matching ack, re-checking the buffer on each emission
 			val matched = withTimeoutOrNull(timeoutMs) {
-				commandQueue.pushEvents
-					.filterIsInstance<Response.Ack>()
-					.first { it.ackCode == confirmation.expectedAck }
+				if (confirmation.expectedAck in receivedAcks) {
+					return@withTimeoutOrNull confirmation.expectedAck
+				}
+				while (true) {
+					val code = arrivals.receive()
+					if (code == confirmation.expectedAck) return@withTimeoutOrNull code
+				}
 			}
 
 			return if (matched != null || confirmation.expectedAck in receivedAcks) {
@@ -987,6 +1004,7 @@ class DeviceConnection internal constructor(
 			}
 		} finally {
 			collectorJob.cancel()
+			arrivals.close()
 		}
 	}
 
