@@ -5,6 +5,7 @@ package com.darkrockstudios.libs.meshcore
 import com.darkrockstudios.libs.meshcore.model.ReceivedBinaryResponse
 import com.darkrockstudios.libs.meshcore.model.ReceivedRawData
 import com.darkrockstudios.libs.meshcore.protocol.CommandQueue
+import com.darkrockstudios.libs.meshcore.protocol.CommandSerializer
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
@@ -59,6 +60,18 @@ class DeviceConnectionTest {
         if (secret.isNotEmpty()) secret.copyInto(data, 34)
         return data
     }
+
+	/** A 0x03 contact frame with a flood path and [lastmod] in the trailing field. */
+	private fun createContactResponse(name: String, lastmod: Long): ByteArray {
+		val data = ByteArray(148)
+		data[0] = 0x03 // PACKET_CONTACT
+		for (i in 1..32) data[i] = i.toByte()
+		data[33] = 0x01 // contact type
+		data[35] = 0xFF.toByte() // flood (signed) path
+		name.encodeToByteArray().copyInto(data, 100, 0, minOf(name.length, 31))
+		CommandSerializer.putUInt32LE(data, 144, lastmod)
+		return data
+	}
 
 	@Test
 	fun getBattery_returnsBatteryInfo() = runTest {
@@ -525,5 +538,60 @@ class DeviceConnectionTest {
 				.drop(baseWrites)
 				.count { it.size == 1 && it[0] == 0x0A.toByte() }
 		assertEquals(2, getMessageWrites)
+	}
+
+	@Test
+	fun getContactsSince_returnsStreamedDeltaWithStreamCursor() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+
+		launch {
+			while (bleConnection.writtenData.size < 3) { kotlinx.coroutines.yield() }
+			// START reports the unfiltered count (7), one filtered contact
+			// follows, END reports that contact's lastmod (1000) as the cursor.
+			bleConnection.simulateResponse(byteArrayOf(0x02, 0x07, 0x00, 0x00, 0x00))
+			bleConnection.simulateResponse(createContactResponse("Delta Node", 1000L))
+			bleConnection.simulateResponse(byteArrayOf(0x04, 0xE8.toByte(), 0x03, 0x00, 0x00))
+		}
+
+		val fetch = connection.getContactsSince(42)
+
+		// The request carried the filter: 42 as 4-byte LE after CMD_GET_CONTACTS (0x04).
+		assertContentEquals(
+			byteArrayOf(0x04, 0x2A, 0x00, 0x00, 0x00),
+			bleConnection.writtenData[2],
+		)
+		assertEquals(1, fetch.contacts.size)
+		assertEquals("Delta Node", fetch.contacts[0].name)
+		assertEquals(1000L, fetch.contacts[0].lastmod)
+		assertEquals(7, fetch.totalAtStart)
+		assertEquals(1000L, fetch.mostRecentLastmod)
+		// A delta is not the full list, so it must not be published.
+		assertEquals(0, connection.contacts.value.size)
 	}
 }

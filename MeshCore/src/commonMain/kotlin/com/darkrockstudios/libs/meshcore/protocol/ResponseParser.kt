@@ -21,9 +21,9 @@ object ResponseParser {
 			ResponseCode.PACKET_SELF_INFO -> parseSelfInfo(data)
 			ResponseCode.PACKET_BATTERY -> parseBattery(data)
 			ResponseCode.PACKET_CHANNEL_INFO -> parseChannelInfo(data)
-			ResponseCode.PACKET_CONTACT_START -> Response.ContactStart
+			ResponseCode.PACKET_CONTACT_START -> parseContactStart(data)
 			ResponseCode.PACKET_CONTACT -> parseContact(data)
-			ResponseCode.PACKET_CONTACT_END -> Response.ContactEnd
+			ResponseCode.PACKET_CONTACT_END -> parseContactEnd(data)
 			ResponseCode.PACKET_MSG_SENT -> parseMessageSent(data)
 			ResponseCode.PACKET_CHANNEL_MSG_RECV -> parseChannelMessage(data, v3 = false)
 			ResponseCode.PACKET_CHANNEL_MSG_RECV_V3 -> parseChannelMessage(data, v3 = true)
@@ -233,6 +233,18 @@ object ResponseParser {
 			gpsLongitude = gpsLon,
 			lastmod = lastmod,
 		)
+	}
+
+	// MyMesh.cpp:1338-1341 / :2361-2365 always write the 4-byte payload; the 0
+	// default is only a malformed-frame guard that must not throw mid-stream.
+	private fun parseContactStart(data: ByteArray): Response.ContactStart {
+		val total = if (data.size >= 5) getUInt32LE(data, 1).toInt() else 0
+		return Response.ContactStart(total)
+	}
+
+	private fun parseContactEnd(data: ByteArray): Response.ContactEnd {
+		val mostRecentLastmod = if (data.size >= 5) getUInt32LE(data, 1) else 0L
+		return Response.ContactEnd(mostRecentLastmod)
 	}
 
 	private fun parseMessageSent(data: ByteArray): Response.MessageSent? {

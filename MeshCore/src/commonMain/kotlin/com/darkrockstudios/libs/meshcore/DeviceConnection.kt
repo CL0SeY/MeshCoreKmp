@@ -472,6 +472,51 @@ class DeviceConnection internal constructor(
 		return contactList
 	}
 
+	/**
+	 * Incremental contact refresh: asks the node for only the contacts whose
+	 * `lastmod` is greater than [since] (firmware `MyMesh.cpp:2355`, request
+	 * shape `[0x04][since as 4-byte LE]`) and returns that delta together with
+	 * the stream's cursor data.
+	 *
+	 * Unlike [getContacts], this does NOT publish to [contacts]: a filtered
+	 * reply is a delta, not the full list, so the caller merges it into the
+	 * contacts it already holds and owns publication.
+	 */
+	suspend fun getContactsSince(since: Int): ContactFetch {
+		val contactList = mutableListOf<Contact>()
+		var totalAtStart = 0
+		var mostRecentLastmod = 0L
+		commandQueue.executeStreaming<Response.ContactEnd>(
+			CommandSerializer.getContacts(since),
+			config.commandTimeout,
+			onResponse = { response ->
+				when (response) {
+					is Response.Contact -> {
+						contactList.add(response.toDomainModel())
+						true // continue
+					}
+
+					is Response.ContactEnd -> {
+						mostRecentLastmod = response.mostRecentLastmod
+						false // stop
+					}
+
+					is Response.ContactStart -> {
+						totalAtStart = response.total
+						true // continue
+					}
+
+					else -> true // ignore others?
+				}
+			}
+		)
+		return ContactFetch(
+			contacts = contactList,
+			totalAtStart = totalAtStart,
+			mostRecentLastmod = mostRecentLastmod,
+		)
+	}
+
 	// --- Stats ---
 
 	suspend fun getCoreStats(): Stats.Core {

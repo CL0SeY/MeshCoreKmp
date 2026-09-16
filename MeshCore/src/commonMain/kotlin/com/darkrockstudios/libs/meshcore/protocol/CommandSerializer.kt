@@ -15,8 +15,20 @@ object CommandSerializer {
 	fun deviceQuery(): ByteArray =
 		byteArrayOf(CommandCode.DEVICE_QUERY.toByte(), 0x03)
 
-	fun getContacts(): ByteArray =
-		byteArrayOf(CommandCode.GET_CONTACTS.toByte())
+	/**
+	 * `CMD_GET_CONTACTS` (0x04). With [since] `null` the frame is the bare
+	 * 1-byte command; with a value it is `[0x04][since as 4-byte LE]`, which
+	 * the firmware reads as an incremental filter when `len >= 5`
+	 * (MyMesh.cpp:1327-1332) and answers with only the contacts whose
+	 * `lastmod` is greater.
+	 */
+	fun getContacts(since: Int? = null): ByteArray {
+		if (since == null) return byteArrayOf(CommandCode.GET_CONTACTS.toByte())
+		val buffer = ByteArray(5)
+		buffer[0] = CommandCode.GET_CONTACTS.toByte()
+		putUInt32LE(buffer, 1, since.toLong())
+		return buffer
+	}
 
 	fun getChannel(index: Int): ByteArray {
 		require(index in 0..7) { "Channel index must be 0-7" }

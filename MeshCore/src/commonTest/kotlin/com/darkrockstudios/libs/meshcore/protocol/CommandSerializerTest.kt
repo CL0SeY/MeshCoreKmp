@@ -67,6 +67,22 @@ class CommandSerializerTest {
 	}
 
 	@Test
+	fun getContacts_noSince_isBareCommand() {
+		// CMD_GET_CONTACTS is 0x04 (MyMesh.cpp:9) — a different namespace from
+		// RESP_CODE_CONTACTS_START/RESP_CODE_END_OF_CONTACTS, which are 0x02/0x04.
+		assertContentEquals(byteArrayOf(0x04), CommandSerializer.getContacts())
+		assertContentEquals(byteArrayOf(0x04), CommandSerializer.getContacts(null))
+	}
+
+	@Test
+	fun getContacts_withSince_encodesLittleEndian() {
+		// 0x01020304 LE → 04 03 02 01 after the command byte; the firmware
+		// reads the optional param when len >= 5 (MyMesh.cpp:1329).
+		val result = CommandSerializer.getContacts(0x01020304)
+		assertContentEquals(byteArrayOf(0x04, 0x04, 0x03, 0x02, 0x01), result)
+	}
+
+	@Test
 	fun getChannel_validIndex() {
 		val result = CommandSerializer.getChannel(3)
 		assertContentEquals(byteArrayOf(0x1F, 0x03), result)

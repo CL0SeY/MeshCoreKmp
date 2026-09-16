@@ -47,7 +47,13 @@ sealed class Response {
 		val secret: String = "",
 	) : Response()
 
-	data object ContactStart : Response()
+	/**
+	 * `RESP_CODE_CONTACTS_START` (0x02): the head of a contact stream. The
+	 * firmware writes `[0x02][count as 4-byte LE]` (MyMesh.cpp:1338-1341),
+	 * where [total] is the node's unfiltered `getNumContacts()` — not the
+	 * number of records that follow, which a `since` filter can shrink.
+	 */
+	data class ContactStart(val total: Int) : Response()
 
 	data class Contact(
 		val publicKey: ByteArray,
@@ -99,7 +105,17 @@ sealed class Response {
 		}
 	}
 
-	data object ContactEnd : Response()
+	/**
+	 * `RESP_CODE_END_OF_CONTACTS` (0x04): the tail of a contact stream, wire
+	 * shape `[0x04][lastmod as 4-byte LE]` (MyMesh.cpp:2361-2365).
+	 *
+	 * [mostRecentLastmod] is the max `lastmod` among the records actually
+	 * streamed in this reply, and 0 when none were streamed. Callers must not
+	 * overwrite a live `since` cursor with it: an empty reply leaves a full
+	 * cursor standing, so a caller that adopts the 0 would re-fetch every
+	 * contact on the next refresh.
+	 */
+	data class ContactEnd(val mostRecentLastmod: Long) : Response()
 
 	data class MessageSent(
 		val messageType: Int,

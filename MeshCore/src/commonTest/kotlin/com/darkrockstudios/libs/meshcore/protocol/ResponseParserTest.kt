@@ -326,9 +326,18 @@ class ResponseParserTest {
 
 	@Test
 	fun parse_contactStart() {
-		val data = byteArrayOf(0x02)
+		// 0x01020304 as 4-byte LE — distinguishes LE from BE.
+		val data = byteArrayOf(0x02, 0x04, 0x03, 0x02, 0x01)
 		val result = ResponseParser.parse(data)
 		assertIs<Response.ContactStart>(result)
+		assertEquals(0x01020304, result.total)
+	}
+
+	@Test
+	fun parse_contactStart_shortFrame_defaultsToZero() {
+		val result = ResponseParser.parse(byteArrayOf(0x02))
+		assertIs<Response.ContactStart>(result)
+		assertEquals(0, result.total)
 	}
 
 	@Test
@@ -370,9 +379,18 @@ class ResponseParserTest {
 
 	@Test
 	fun parse_contactEnd() {
-		val data = byteArrayOf(0x04)
+		// 0x01020304 as 4-byte LE — distinguishes LE from BE.
+		val data = byteArrayOf(0x04, 0x04, 0x03, 0x02, 0x01)
 		val result = ResponseParser.parse(data)
 		assertIs<Response.ContactEnd>(result)
+		assertEquals(0x01020304L, result.mostRecentLastmod)
+	}
+
+	@Test
+	fun parse_contactEnd_shortFrame_defaultsToZero() {
+		val result = ResponseParser.parse(byteArrayOf(0x04))
+		assertIs<Response.ContactEnd>(result)
+		assertEquals(0L, result.mostRecentLastmod)
 	}
 
 	@Test
