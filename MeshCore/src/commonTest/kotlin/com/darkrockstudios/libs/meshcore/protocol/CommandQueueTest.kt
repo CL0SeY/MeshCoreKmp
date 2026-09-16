@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
@@ -235,5 +236,102 @@ class CommandQueueTest {
 		assertIs<Response.Ok>(result)
 
 		collectJob.cancel()
+	}
+
+	@Test
+	fun pushEvents_pathUpdatedRoutedDuringCommand() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+
+		val pushEvents = mutableListOf<Response>()
+		val collectJob = backgroundScope.launch {
+			queue.pushEvents.collect { pushEvents.add(it) }
+		}
+		testScheduler.advanceUntilIdle()
+
+		// PUSH_CODE_PATH_UPDATED (0x81): exactly [0x81][32-byte contact public key].
+		val publicKey = ByteArray(32) { (it + 1).toByte() }
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) {
+				kotlinx.coroutines.yield()
+			}
+			// Send a path-updated push while a command is pending
+			bleConnection.simulateResponse(byteArrayOf(0x81.toByte()) + publicKey)
+			kotlinx.coroutines.yield()
+			// Then send the actual command response
+			bleConnection.simulateResponse(byteArrayOf(0x00))
+		}
+
+		val result = queue.execute<Response.Ok>(
+			command = CommandSerializer.getBattery(),
+		)
+		testScheduler.advanceUntilIdle()
+
+		assertEquals(1, pushEvents.size)
+		assertIs<Response.PathUpdated>(pushEvents[0])
+		val pathUpdated = pushEvents[0] as Response.PathUpdated
+		assertEquals(32, pathUpdated.publicKey.size)
+		assertContentEquals(publicKey, pathUpdated.publicKey)
+		assertIs<Response.Ok>(result)
+
+		collectJob.cancel()
+	}
+
+	@Test
+	fun execute_stalledWriteTimesOutDisconnectsAndReleasesQueue() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+			writeTimeout = 100.milliseconds,
+		)
+		bleConnection.hangWrite = true
+
+		assertFailsWith<MeshCoreException.CommandTimeout> {
+			queue.execute<Response.Ok>(command = CommandSerializer.getBattery())
+		}
+		assertEquals(1, bleConnection.disconnectCount)
+
+		// The stalled write never completed, yet the queue mutex was released:
+		// the next command goes through and is answered.
+		bleConnection.hangWrite = false
+		val stalledWrites = bleConnection.writtenData.size
+		launch {
+			while (bleConnection.writtenData.size <= stalledWrites) {
+				kotlinx.coroutines.yield()
+			}
+			bleConnection.simulateResponse(byteArrayOf(0x00, 0x2A, 0x00, 0x00, 0x00))
+		}
+
+		val result = queue.execute<Response.Ok>(command = CommandSerializer.getBattery())
+
+		assertEquals(42, result.value)
+		assertEquals(stalledWrites + 1, bleConnection.writtenData.size)
+	}
+
+	@Test
+	fun execute_cancelledWriteDoesNotDisconnect() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		bleConnection.hangWrite = true
+
+		val caller = launch {
+			queue.execute<Response.Ok>(command = CommandSerializer.getBattery())
+		}
+		// runCurrent, not advanceUntilIdle: advancing virtual time to idle fires
+		// the write timeout and turns this into the stalled-write case.
+		testScheduler.runCurrent()
+		caller.cancel()
+		testScheduler.advanceUntilIdle()
+
+		kotlin.test.assertTrue(caller.isCancelled)
+		assertEquals(0, bleConnection.disconnectCount, "a cancelled caller is not a wedged link")
 	}
 }

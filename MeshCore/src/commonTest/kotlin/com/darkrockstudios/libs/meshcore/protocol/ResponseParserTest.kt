@@ -1,8 +1,10 @@
 package com.darkrockstudios.libs.meshcore.protocol
 
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 
 class ResponseParserTest {
@@ -127,18 +129,39 @@ class ResponseParserTest {
 		assertEquals("", result.model)
 	}
 
-	@Test
-	fun parse_channelInfo() {
-		val data = ByteArray(34)
-		data[0] = 0x12
-		data[1] = 0x02 // channel index 2
-		"General".encodeToByteArray().copyInto(data, 2)
+    @Test
+    fun parse_channelInfo() {
+        val data = ByteArray(50)
+        data[0] = 0x12
+        data[1] = 0x02 // channel index 2
+        "General".encodeToByteArray().copyInto(data, 2)
+        for (i in 0 until 16) data[34 + i] = i.toByte()
 
-		val result = ResponseParser.parse(data)
-		assertIs<Response.ChannelInfo>(result)
-		assertEquals(2, result.index)
-		assertEquals("General", result.name)
-	}
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals(2, result.index)
+        assertEquals("General", result.name)
+        assertEquals("000102030405060708090a0b0c0d0e0f", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_withoutSecret_returnsEmptySecret() {
+        val data = ByteArray(34)
+        data[0] = 0x12
+        data[1] = 0x02
+        "General".encodeToByteArray().copyInto(data, 2)
+
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_shortResponse_returnsEmptySecret() {
+        val result = ResponseParser.parse(byteArrayOf(0x12, 0x02))
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals("", result.secret)
+    }
 
 	@Test
 	fun parse_messageSent() {
@@ -150,7 +173,7 @@ class ResponseParserTest {
 		data[3] = 0xBB.toByte()
 		data[4] = 0xCC.toByte()
 		data[5] = 0xDD.toByte()
-		// Timeout = 30 seconds (0x1E000000 LE)
+		// Timeout = 30 ms (0x1E000000 LE)
 		data[6] = 0x1E
 		data[7] = 0x00
 		data[8] = 0x00
@@ -160,7 +183,7 @@ class ResponseParserTest {
 		assertIs<Response.MessageSent>(result)
 		assertEquals(1, result.messageType)
 		assertEquals("aabbccdd", result.expectedAck)
-		assertEquals(30, result.suggestedTimeoutSeconds)
+		assertEquals(30, result.suggestedTimeoutMillis)
 	}
 
 	@Test
@@ -303,16 +326,71 @@ class ResponseParserTest {
 
 	@Test
 	fun parse_contactStart() {
-		val data = byteArrayOf(0x02)
+		// 0x01020304 as 4-byte LE — distinguishes LE from BE.
+		val data = byteArrayOf(0x02, 0x04, 0x03, 0x02, 0x01)
 		val result = ResponseParser.parse(data)
 		assertIs<Response.ContactStart>(result)
+		assertEquals(0x01020304, result.total)
+	}
+
+	@Test
+	fun parse_contactStart_shortFrame_defaultsToZero() {
+		val result = ResponseParser.parse(byteArrayOf(0x02))
+		assertIs<Response.ContactStart>(result)
+		assertEquals(0, result.total)
+	}
+
+	@Test
+	fun parse_contactRoundTrip_preservesEmojiNameAndPath() {
+		// Regression net for the eaten-panda bug: the 0x09 write frame used
+		// to omit the path_len byte, so the node stored name[1:] (the panda's
+		// F0 went missing, leaving 3x U+FFFD). A frame built by the fixed
+		// serializer must parse back byte-identical through the 0x03 layout.
+		val publicKey = ByteArray(32) { it.toByte() }
+		val path = byteArrayOf(0x0A, 0x0B, 0x0C)
+		val frame =
+			CommandSerializer.updateContact(
+				publicKey = publicKey,
+				name = "🐼 test node",
+				type = 0,
+				flags = 1,
+				outPath = path,
+				outPathLen = 3,
+				outPathHashMode = 0,
+				lastAdvertTimestamp = 1_700_000_000L,
+				gpsLatitude = 48.85837,
+				gpsLongitude = 2.294481,
+			)
+		// Re-tag as a 0x03 contact response and parse.
+		val data = frame.copyOf()
+		data[0] = 0x03
+		val result = ResponseParser.parse(data)
+		assertIs<Response.Contact>(result)
+		assertEquals("🐼 test node", result.name)
+		assertEquals(3, result.outPathLen)
+		assertEquals(0, result.outPathHashMode)
+		assertEquals(path.toList(), result.outPath.toList())
+		assertEquals(1, result.flags)
+		assertEquals(1_700_000_000L, result.lastAdvertTimestamp)
+		// Double x1e6 truncation is lossy at the 1e-9 level; compare loosely.
+		assertEquals(48.85837, result.gpsLatitude ?: 0.0, 0.000001)
+		assertEquals(2.294481, result.gpsLongitude ?: 0.0, 0.000001)
 	}
 
 	@Test
 	fun parse_contactEnd() {
-		val data = byteArrayOf(0x04)
+		// 0x01020304 as 4-byte LE — distinguishes LE from BE.
+		val data = byteArrayOf(0x04, 0x04, 0x03, 0x02, 0x01)
 		val result = ResponseParser.parse(data)
 		assertIs<Response.ContactEnd>(result)
+		assertEquals(0x01020304L, result.mostRecentLastmod)
+	}
+
+	@Test
+	fun parse_contactEnd_shortFrame_defaultsToZero() {
+		val result = ResponseParser.parse(byteArrayOf(0x04))
+		assertIs<Response.ContactEnd>(result)
+		assertEquals(0L, result.mostRecentLastmod)
 	}
 
 	@Test
@@ -661,10 +739,12 @@ class ResponseParserTest {
 
 	@Test
 	fun parse_telemetryResponse() {
-		val data = ByteArray(10)
+		// Firmware frame: [0x8B][reserved 0x00][6-byte prefix][telemetry data]
+		val data = ByteArray(11)
 		data[0] = 0x8B.toByte()
-		for (i in 1..6) data[i] = i.toByte()
-		data[7] = 0xDE.toByte(); data[8] = 0xAD.toByte(); data[9] = 0xBE.toByte()
+		data[1] = 0x00 // reserved byte
+		byteArrayOf(0x01, 0x02, 0x03, 0x04, 0x05, 0x06).copyInto(data, 2)
+		data[8] = 0xDE.toByte(); data[9] = 0xAD.toByte(); data[10] = 0xBE.toByte()
 		val result = ResponseParser.parse(data)
 		assertIs<Response.TelemetryResponse>(result)
 		assertEquals("010203040506", result.publicKeyPrefix)
@@ -677,6 +757,94 @@ class ResponseParserTest {
 		val result = ResponseParser.parse(data)
 		assertIs<Response.PathDiscoveryResponse>(result)
 		assertEquals(2, result.rawData.size)
+	}
+
+	@Test
+	fun parse_pathUpdated_extractsKeyContents() {
+		// PUSH_CODE_PATH_UPDATED (0x81) frame: [0x81][32-byte public key]. The
+		// assertions are on the key *contents*, not just the subtype: an
+		// off-by-one slice would still be a PathUpdated.
+		val publicKey = ByteArray(32) { (it + 1).toByte() }
+		val data = byteArrayOf(0x81.toByte()) + publicKey
+
+		val result = ResponseParser.parse(data)
+		assertIs<Response.PathUpdated>(result)
+		assertEquals(32, result.publicKey.size)
+		assertContentEquals(publicKey, result.publicKey)
+		assertEquals(0x01.toByte(), result.publicKey[0])
+		assertEquals(0x20.toByte(), result.publicKey[31])
+	}
+
+	@Test
+	fun parse_pathUpdated_equalityIsContentBased() {
+		// Two events carrying the same key bytes must be equal (and hash
+		// alike). A plain data class would compare the key arrays by reference
+		// and fail both assertions.
+		val keyBytes = ByteArray(32) { (it + 1).toByte() }
+		val first = Response.PathUpdated(keyBytes.copyOf())
+		val second = Response.PathUpdated(keyBytes.copyOf())
+
+		assertEquals(first, second)
+		assertEquals(first.hashCode(), second.hashCode())
+
+		// A parsed event equals an independently constructed one.
+		val parsed = ResponseParser.parse(byteArrayOf(0x81.toByte()) + keyBytes)
+		assertIs<Response.PathUpdated>(parsed)
+		assertEquals(first, parsed)
+		assertEquals(first.hashCode(), parsed.hashCode())
+
+		val otherKey = Response.PathUpdated(ByteArray(32) { (it + 2).toByte() })
+		assertNotEquals(first, otherKey)
+	}
+
+	@Test
+	fun parse_pathUpdated_allZeroKey_parses() {
+		// Zero bytes are key material, not absence or a terminator.
+		val publicKey = ByteArray(32)
+		val result = ResponseParser.parse(byteArrayOf(0x81.toByte()) + publicKey)
+		assertIs<Response.PathUpdated>(result)
+		assertEquals(32, result.publicKey.size)
+		assertContentEquals(publicKey, result.publicKey)
+	}
+
+	@Test
+	fun parse_pathUpdated_allOnesKey_parses() {
+		val publicKey = ByteArray(32) { 0xFF.toByte() }
+		val result = ResponseParser.parse(byteArrayOf(0x81.toByte()) + publicKey)
+		assertIs<Response.PathUpdated>(result)
+		assertEquals(32, result.publicKey.size)
+		assertContentEquals(publicKey, result.publicKey)
+	}
+
+	@Test
+	fun parse_pathUpdated_wrongLengthFrames_returnsUnhandledWithRawPayload() {
+		val keyBytes = ByteArray(32) { (it + 1).toByte() }
+
+		// One byte short: a 32-byte frame is not a path update. It must
+		// degrade to the generic branch's Unhandled, payload = data[1..],
+		// never to a truncated PathUpdated.
+		val shortFrame = byteArrayOf(0x81.toByte()) + keyBytes.copyOfRange(0, 31)
+		val shortResult = ResponseParser.parse(shortFrame)
+		assertIs<Response.Unhandled>(shortResult)
+		assertEquals(0x81, shortResult.code)
+		assertContentEquals(keyBytes.copyOfRange(0, 31), shortResult.rawData)
+
+		// One byte long: a 34-byte frame is not a path update either.
+		val longFrame = byteArrayOf(0x81.toByte()) + keyBytes + 0x99.toByte()
+		val longResult = ResponseParser.parse(longFrame)
+		assertIs<Response.Unhandled>(longResult)
+		assertEquals(0x81, longResult.code)
+		assertContentEquals(keyBytes + 0x99.toByte(), longResult.rawData)
+
+		// Code byte alone: Unhandled with an empty payload, as before.
+		val codeOnlyResult = ResponseParser.parse(byteArrayOf(0x81.toByte()))
+		assertIs<Response.Unhandled>(codeOnlyResult)
+		assertEquals(0x81, codeOnlyResult.code)
+		assertEquals(0, codeOnlyResult.rawData.size)
+
+		// Zero-length data never reaches the 0x81 branch: `parse` returns
+		// null, which is the pre-existing contract for an empty read.
+		assertNull(ResponseParser.parse(byteArrayOf()))
 	}
 
 	@Test
