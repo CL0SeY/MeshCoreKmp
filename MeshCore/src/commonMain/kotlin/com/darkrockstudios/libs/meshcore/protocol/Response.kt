@@ -104,7 +104,7 @@ sealed class Response {
 	data class MessageSent(
 		val messageType: Int,
 		val expectedAck: String,
-		val suggestedTimeoutSeconds: Int,
+		val suggestedTimeoutMillis: Int,
 	) : Response()
 
 	data class ChannelMessageReceived(

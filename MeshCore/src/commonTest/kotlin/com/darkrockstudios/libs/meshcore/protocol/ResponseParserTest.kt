@@ -173,7 +173,7 @@ class ResponseParserTest {
 		data[3] = 0xBB.toByte()
 		data[4] = 0xCC.toByte()
 		data[5] = 0xDD.toByte()
-		// Timeout = 30 seconds (0x1E000000 LE)
+		// Timeout = 30 ms (0x1E000000 LE)
 		data[6] = 0x1E
 		data[7] = 0x00
 		data[8] = 0x00
@@ -183,7 +183,7 @@ class ResponseParserTest {
 		assertIs<Response.MessageSent>(result)
 		assertEquals(1, result.messageType)
 		assertEquals("aabbccdd", result.expectedAck)
-		assertEquals(30, result.suggestedTimeoutSeconds)
+		assertEquals(30, result.suggestedTimeoutMillis)
 	}
 
 	@Test

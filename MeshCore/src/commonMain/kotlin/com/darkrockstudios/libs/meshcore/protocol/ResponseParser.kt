@@ -244,7 +244,7 @@ object ResponseParser {
 		return Response.MessageSent(
 			messageType = msgType,
 			expectedAck = expectedAck,
-			suggestedTimeoutSeconds = suggestedTimeout,
+			suggestedTimeoutMillis = suggestedTimeout,
 		)
 	}
 

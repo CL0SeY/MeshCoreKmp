@@ -380,14 +380,14 @@ class DeviceConnectionTest {
 			resp[0] = 0x06
 			resp[1] = 0x01 // message type
 			resp[2] = 0x39; resp[3] = 0x30; resp[4] = 0x00; resp[5] = 0x00 // expected ack
-			resp[6] = 0x1E; resp[7] = 0x00; resp[8] = 0x00; resp[9] = 0x00 // timeout = 30s
+			resp[6] = 0x1E; resp[7] = 0x00; resp[8] = 0x00; resp[9] = 0x00 // timeout = 30 ms
 			bleConnection.simulateResponse(resp)
 		}
 
 		val publicKey = ByteArray(32) { it.toByte() }
 		val confirmation = connection.sendBinaryRequest(publicKey, byteArrayOf(0xFF.toByte()))
 		assertEquals(1, confirmation.messageType)
-		assertEquals(30, confirmation.suggestedTimeoutSeconds)
+		assertEquals(30, confirmation.suggestedTimeoutMillis)
 
 		// Verify the command was sent with correct format
 		val cmd = bleConnection.writtenData[2]

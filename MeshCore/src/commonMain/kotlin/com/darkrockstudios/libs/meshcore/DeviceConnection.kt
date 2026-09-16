@@ -13,6 +13,14 @@ import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
+/**
+ * Upper bound on a single ACK wait. The node's estimate arrives as a raw
+ * uint32 in milliseconds, so a garbled frame must not hold the caller — and
+ * the BLE command gate the caller sits behind — for hours. Even a multi-hop
+ * flood on the slowest spreading factor estimates well under two minutes.
+ */
+private const val MAX_ACK_WAIT_MILLIS = 120_000L
+
 class DeviceConnection internal constructor(
 	private val bleConnection: BleConnection,
 	internal val commandQueue: CommandQueue,
@@ -228,13 +236,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -257,13 +265,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -309,7 +317,7 @@ class DeviceConnection internal constructor(
 		return MessageSentConfirmation(
 			messageType = resp.messageType,
 			expectedAck = resp.expectedAck,
-			suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+			suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 		)
 	}
 
@@ -326,13 +334,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -620,13 +628,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -655,13 +663,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -693,13 +701,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -790,13 +798,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -815,13 +823,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -854,13 +862,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -907,8 +915,13 @@ class DeviceConnection internal constructor(
 			// Check if ack already arrived while sending
 			if (confirmation.expectedAck in receivedAcks) return Result.success(confirmation)
 
-			val timeoutMs = if (confirmation.suggestedTimeoutSeconds > 0) {
-				confirmation.suggestedTimeoutSeconds * 1000L
+			val timeoutMs = if (confirmation.suggestedTimeoutMillis > 0) {
+				// The node already reports milliseconds (firmware
+				// calcDirectTimeoutMillisFor / calcFloodTimeoutMillisFor).
+				// Clamped: the field is a raw uint32 off the wire, so a garbled
+				// frame must not park the caller for hours — floods on the
+				// slowest spreading factors estimate well under two minutes.
+				confirmation.suggestedTimeoutMillis.toLong().coerceAtMost(MAX_ACK_WAIT_MILLIS)
 			} else {
 				config.commandTimeout.inWholeMilliseconds
 			}
