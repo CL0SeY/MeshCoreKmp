@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
@@ -232,6 +233,49 @@ class CommandQueueTest {
 
 		assertEquals(1, pushEvents.size)
 		assertIs<Response.RawDataReceived>(pushEvents[0])
+		assertIs<Response.Ok>(result)
+
+		collectJob.cancel()
+	}
+
+	@Test
+	fun pushEvents_pathUpdatedRoutedDuringCommand() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+
+		val pushEvents = mutableListOf<Response>()
+		val collectJob = backgroundScope.launch {
+			queue.pushEvents.collect { pushEvents.add(it) }
+		}
+		testScheduler.advanceUntilIdle()
+
+		// PUSH_CODE_PATH_UPDATED (0x81): exactly [0x81][32-byte contact public key].
+		val publicKey = ByteArray(32) { (it + 1).toByte() }
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) {
+				kotlinx.coroutines.yield()
+			}
+			// Send a path-updated push while a command is pending
+			bleConnection.simulateResponse(byteArrayOf(0x81.toByte()) + publicKey)
+			kotlinx.coroutines.yield()
+			// Then send the actual command response
+			bleConnection.simulateResponse(byteArrayOf(0x00))
+		}
+
+		val result = queue.execute<Response.Ok>(
+			command = CommandSerializer.getBattery(),
+		)
+		testScheduler.advanceUntilIdle()
+
+		assertEquals(1, pushEvents.size)
+		assertIs<Response.PathUpdated>(pushEvents[0])
+		val pathUpdated = pushEvents[0] as Response.PathUpdated
+		assertEquals(32, pathUpdated.publicKey.size)
+		assertContentEquals(publicKey, pathUpdated.publicKey)
 		assertIs<Response.Ok>(result)
 
 		collectJob.cancel()

@@ -59,6 +59,7 @@ class CommandQueue(
 		is Response.TraceData -> true
 		is Response.NewAdvert -> true
 		is Response.TelemetryResponse -> true
+		is Response.PathUpdated -> true
 		is Response.PathDiscoveryResponse -> true
 		is Response.ControlData -> true
 		is Response.ContactDeleted -> true

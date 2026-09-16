@@ -1,8 +1,10 @@
 package com.darkrockstudios.libs.meshcore.protocol
 
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 
 class ResponseParserTest {
@@ -737,6 +739,94 @@ class ResponseParserTest {
 		val result = ResponseParser.parse(data)
 		assertIs<Response.PathDiscoveryResponse>(result)
 		assertEquals(2, result.rawData.size)
+	}
+
+	@Test
+	fun parse_pathUpdated_extractsKeyContents() {
+		// PUSH_CODE_PATH_UPDATED (0x81) frame: [0x81][32-byte public key]. The
+		// assertions are on the key *contents*, not just the subtype: an
+		// off-by-one slice would still be a PathUpdated.
+		val publicKey = ByteArray(32) { (it + 1).toByte() }
+		val data = byteArrayOf(0x81.toByte()) + publicKey
+
+		val result = ResponseParser.parse(data)
+		assertIs<Response.PathUpdated>(result)
+		assertEquals(32, result.publicKey.size)
+		assertContentEquals(publicKey, result.publicKey)
+		assertEquals(0x01.toByte(), result.publicKey[0])
+		assertEquals(0x20.toByte(), result.publicKey[31])
+	}
+
+	@Test
+	fun parse_pathUpdated_equalityIsContentBased() {
+		// Two events carrying the same key bytes must be equal (and hash
+		// alike). A plain data class would compare the key arrays by reference
+		// and fail both assertions.
+		val keyBytes = ByteArray(32) { (it + 1).toByte() }
+		val first = Response.PathUpdated(keyBytes.copyOf())
+		val second = Response.PathUpdated(keyBytes.copyOf())
+
+		assertEquals(first, second)
+		assertEquals(first.hashCode(), second.hashCode())
+
+		// A parsed event equals an independently constructed one.
+		val parsed = ResponseParser.parse(byteArrayOf(0x81.toByte()) + keyBytes)
+		assertIs<Response.PathUpdated>(parsed)
+		assertEquals(first, parsed)
+		assertEquals(first.hashCode(), parsed.hashCode())
+
+		val otherKey = Response.PathUpdated(ByteArray(32) { (it + 2).toByte() })
+		assertNotEquals(first, otherKey)
+	}
+
+	@Test
+	fun parse_pathUpdated_allZeroKey_parses() {
+		// Zero bytes are key material, not absence or a terminator.
+		val publicKey = ByteArray(32)
+		val result = ResponseParser.parse(byteArrayOf(0x81.toByte()) + publicKey)
+		assertIs<Response.PathUpdated>(result)
+		assertEquals(32, result.publicKey.size)
+		assertContentEquals(publicKey, result.publicKey)
+	}
+
+	@Test
+	fun parse_pathUpdated_allOnesKey_parses() {
+		val publicKey = ByteArray(32) { 0xFF.toByte() }
+		val result = ResponseParser.parse(byteArrayOf(0x81.toByte()) + publicKey)
+		assertIs<Response.PathUpdated>(result)
+		assertEquals(32, result.publicKey.size)
+		assertContentEquals(publicKey, result.publicKey)
+	}
+
+	@Test
+	fun parse_pathUpdated_wrongLengthFrames_returnsUnhandledWithRawPayload() {
+		val keyBytes = ByteArray(32) { (it + 1).toByte() }
+
+		// One byte short: a 32-byte frame is not a path update. It must
+		// degrade to the generic branch's Unhandled, payload = data[1..],
+		// never to a truncated PathUpdated.
+		val shortFrame = byteArrayOf(0x81.toByte()) + keyBytes.copyOfRange(0, 31)
+		val shortResult = ResponseParser.parse(shortFrame)
+		assertIs<Response.Unhandled>(shortResult)
+		assertEquals(0x81, shortResult.code)
+		assertContentEquals(keyBytes.copyOfRange(0, 31), shortResult.rawData)
+
+		// One byte long: a 34-byte frame is not a path update either.
+		val longFrame = byteArrayOf(0x81.toByte()) + keyBytes + 0x99.toByte()
+		val longResult = ResponseParser.parse(longFrame)
+		assertIs<Response.Unhandled>(longResult)
+		assertEquals(0x81, longResult.code)
+		assertContentEquals(keyBytes + 0x99.toByte(), longResult.rawData)
+
+		// Code byte alone: Unhandled with an empty payload, as before.
+		val codeOnlyResult = ResponseParser.parse(byteArrayOf(0x81.toByte()))
+		assertIs<Response.Unhandled>(codeOnlyResult)
+		assertEquals(0x81, codeOnlyResult.code)
+		assertEquals(0, codeOnlyResult.rawData.size)
+
+		// Zero-length data never reaches the 0x81 branch: `parse` returns
+		// null, which is the pre-existing contract for an empty read.
+		assertNull(ResponseParser.parse(byteArrayOf()))
 	}
 
 	@Test

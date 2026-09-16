@@ -321,6 +321,24 @@ sealed class Response {
 		override fun hashCode(): Int = rawData.contentHashCode()
 	}
 
+	/**
+	 * `PUSH_CODE_PATH_UPDATED` (0x81): the node changed a contact's stored out
+	 * path. The wire frame is exactly `[0x81][32-byte contact public key]` and
+	 * carries no path bytes (firmware `MyMesh.cpp` `onContactPathUpdated`), so
+	 * the key is all this event can report. Content-based equality, matching
+	 * the other byte-array responses: a plain data class would compare the
+	 * array by reference and two identical frames would not be equal.
+	 */
+	data class PathUpdated(val publicKey: ByteArray) : Response() {
+		override fun equals(other: Any?): Boolean {
+			if (this === other) return true
+			if (other !is PathUpdated) return false
+			return publicKey.contentEquals(other.publicKey)
+		}
+
+		override fun hashCode(): Int = publicKey.contentHashCode()
+	}
+
 	data class ControlData(val type: Int, val payload: ByteArray) : Response() {
 		override fun equals(other: Any?): Boolean {
 			if (this === other) return true

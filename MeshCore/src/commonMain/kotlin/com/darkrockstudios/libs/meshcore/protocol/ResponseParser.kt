@@ -2,6 +2,14 @@ package com.darkrockstudios.libs.meshcore.protocol
 
 object ResponseParser {
 
+	/**
+	 * Wire size of a `PUSH_CODE_PATH_UPDATED` frame: the code byte plus the
+	 * 32-byte contact public key. The firmware sends no path bytes
+	 * (`MyMesh.cpp` `onContactPathUpdated`), so any other length is not a
+	 * path update.
+	 */
+	private const val PATH_UPDATED_FRAME_SIZE = 33
+
 	fun parse(data: ByteArray): Response? {
 		if (data.isEmpty()) return null
 		val code = data[0].toInt() and 0xFF
@@ -56,6 +64,7 @@ object ResponseParser {
 					data.size
 				)
 			)
+			ResponseCode.PUSH_CODE_PATH_UPDATED -> parsePathUpdated(data)
 
 			ResponseCode.PUSH_CODE_CONTROL_DATA -> parseControlData(data)
 			ResponseCode.PUSH_CODE_CONTACT_DELETED -> parseContactDeleted(data)
@@ -448,6 +457,20 @@ object ResponseParser {
 		val telemetryData = if (data.size > 8) data.copyOfRange(8, data.size) else ByteArray(0)
 		return Response.TelemetryResponse(prefix, telemetryData)
 	}
+
+	/**
+	 * `PUSH_CODE_PATH_UPDATED`: exactly `[0x81][32-byte public key]`. Only that
+	 * exact frame is a path update; a shorter or longer one falls through to
+	 * [Response.Unhandled] with the same code point and payload the generic
+	 * branch would have produced, so a malformed frame never becomes a partial
+	 * or zero-padded typed event.
+	 */
+	private fun parsePathUpdated(data: ByteArray): Response =
+		if (data.size == PATH_UPDATED_FRAME_SIZE) {
+			Response.PathUpdated(data.copyOfRange(1, PATH_UPDATED_FRAME_SIZE))
+		} else {
+			Response.Unhandled(ResponseCode.PUSH_CODE_PATH_UPDATED, data.copyOfRange(1, data.size))
+		}
 
 	private fun parseControlData(data: ByteArray): Response.ControlData {
 		val type = if (data.size >= 2) data[1].toInt() and 0xFF else 0

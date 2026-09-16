@@ -78,6 +78,10 @@ class DeviceConnection internal constructor(
 	val telemetryResponses: Flow<Response.TelemetryResponse> = commandQueue.pushEvents
 		.filterIsInstance<Response.TelemetryResponse>()
 
+	/** `PUSH_CODE_PATH_UPDATED` pushes: the node changed a contact's out path. */
+	val pathUpdated: Flow<Response.PathUpdated> = commandQueue.pushEvents
+		.filterIsInstance<Response.PathUpdated>()
+
 	val pathDiscoveryResponses: Flow<Response.PathDiscoveryResponse> = commandQueue.pushEvents
 		.filterIsInstance<Response.PathDiscoveryResponse>()
 
