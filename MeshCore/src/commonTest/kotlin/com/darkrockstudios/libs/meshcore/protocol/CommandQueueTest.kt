@@ -280,4 +280,58 @@ class CommandQueueTest {
 
 		collectJob.cancel()
 	}
+
+	@Test
+	fun execute_stalledWriteTimesOutDisconnectsAndReleasesQueue() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+			writeTimeout = 100.milliseconds,
+		)
+		bleConnection.hangWrite = true
+
+		assertFailsWith<MeshCoreException.CommandTimeout> {
+			queue.execute<Response.Ok>(command = CommandSerializer.getBattery())
+		}
+		assertEquals(1, bleConnection.disconnectCount)
+
+		// The stalled write never completed, yet the queue mutex was released:
+		// the next command goes through and is answered.
+		bleConnection.hangWrite = false
+		val stalledWrites = bleConnection.writtenData.size
+		launch {
+			while (bleConnection.writtenData.size <= stalledWrites) {
+				kotlinx.coroutines.yield()
+			}
+			bleConnection.simulateResponse(byteArrayOf(0x00, 0x2A, 0x00, 0x00, 0x00))
+		}
+
+		val result = queue.execute<Response.Ok>(command = CommandSerializer.getBattery())
+
+		assertEquals(42, result.value)
+		assertEquals(stalledWrites + 1, bleConnection.writtenData.size)
+	}
+
+	@Test
+	fun execute_cancelledWriteDoesNotDisconnect() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		bleConnection.hangWrite = true
+
+		val caller = launch {
+			queue.execute<Response.Ok>(command = CommandSerializer.getBattery())
+		}
+		// runCurrent, not advanceUntilIdle: advancing virtual time to idle fires
+		// the write timeout and turns this into the stalled-write case.
+		testScheduler.runCurrent()
+		caller.cancel()
+		testScheduler.advanceUntilIdle()
+
+		kotlin.test.assertTrue(caller.isCancelled)
+		assertEquals(0, bleConnection.disconnectCount, "a cancelled caller is not a wedged link")
+	}
 }

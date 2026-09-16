@@ -4,6 +4,8 @@ import com.darkrockstudios.libs.meshcore.MeshCoreException
 import com.darkrockstudios.libs.meshcore.ble.BleConnection
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -18,6 +20,7 @@ class CommandQueue(
 	private val connection: BleConnection,
 	scope: CoroutineScope,
 	private val defaultTimeout: Duration = 5.seconds,
+	private val writeTimeout: Duration = 10.seconds,
 ) {
 	private val commandMutex = Mutex()
 
@@ -79,35 +82,71 @@ class CommandQueue(
 		timeout: Duration = defaultTimeout,
 		onResponse: suspend (Response) -> Boolean,
 	): T {
-		commandMutex.withLock {
-			val responseChannel = Channel<Response>(1)
-			pendingResponseChannel = responseChannel
-
-			try {
-				connection.write(command)
-				var lastResponse: Response? = null
-				while (true) {
-					val response = withTimeout(timeout) {
-						responseChannel.receive()
-					}
-					if (response is Response.Error) {
-						throw MeshCoreException.DeviceError(response.code)
-					}
-					lastResponse = response
-					if (!onResponse(response)) {
-						break
-					}
-				}
-				@Suppress("UNCHECKED_CAST")
-				return lastResponse as T
-			} catch (e: kotlinx.coroutines.TimeoutCancellationException) {
-				throw MeshCoreException.CommandTimeout(
-					"Command timed out after $timeout"
-				)
-			} finally {
-				pendingResponseChannel = null
-				responseChannel.close()
+		try {
+			return commandMutex.withLock {
+				awaitStreaming(command, timeout, onResponse)
 			}
+		} catch (e: WriteStalled) {
+			// The write never completed: the link is wedged and a disconnect is
+			// the only cure. It must run with the mutex already released —
+			// disconnecting while holding it can deadlock the collector and
+			// reset() paths that also take the lock.
+			connection.disconnect()
+			throw MeshCoreException.CommandTimeout(
+				"Link stalled: write did not complete within ${e.stalledFor}"
+			)
+		}
+	}
+
+	/**
+	 * Runs under [commandMutex]. The write is bounded so a lost GATT completion
+	 * cannot hold the queue — and every later command behind it — forever.
+	 * Throws [WriteStalled] so the caller can disconnect after releasing the
+	 * mutex.
+	 */
+	private suspend fun <T : Response> awaitStreaming(
+		command: ByteArray,
+		timeout: Duration,
+		onResponse: suspend (Response) -> Boolean,
+	): T {
+		val responseChannel = Channel<Response>(1)
+		pendingResponseChannel = responseChannel
+
+		try {
+			try {
+				withTimeout(writeTimeout) {
+					connection.write(command)
+				}
+			} catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+				// Only a genuine timeout is a stall: if the caller's coroutine
+				// was cancelled instead, that cancellation must win — a plain
+				// cancel is not a wedged link and must not disconnect.
+				currentCoroutineContext().ensureActive()
+				throw WriteStalled(writeTimeout)
+			}
+
+			var lastResponse: Response? = null
+			while (true) {
+				val response = withTimeout(timeout) {
+					responseChannel.receive()
+				}
+				if (response is Response.Error) {
+					throw MeshCoreException.DeviceError(response.code)
+				}
+				lastResponse = response
+				if (!onResponse(response)) {
+					break
+				}
+			}
+			@Suppress("UNCHECKED_CAST")
+			return lastResponse as T
+		} catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+			throw MeshCoreException.CommandTimeout(
+				"Command timed out after $timeout"
+			)
+		} finally {
+			pendingResponseChannel = null
+			responseChannel.close()
 		}
 	}
 
@@ -115,4 +154,12 @@ class CommandQueue(
 		pendingResponseChannel?.close()
 		pendingResponseChannel = null
 	}
+
+	/**
+	 * Internal signal: `connection.write` did not complete within [writeTimeout].
+	 * [executeStreaming] converts it into a disconnect plus a public
+	 * [MeshCoreException.CommandTimeout]; the disconnect happens with the queue
+	 * mutex already released, and this exception never escapes as itself.
+	 */
+	private class WriteStalled(val stalledFor: Duration) : Exception()
 }

@@ -24,8 +24,12 @@ class FakeBleConnection : BleConnection {
 	var mtuFailure: Throwable? = null
 	var hangMtu: Boolean = false
 
+	/** When set, [write] records the frame and then never returns — a lost GATT completion. */
+	var hangWrite: Boolean = false
+
 	override suspend fun write(data: ByteArray) {
 		writtenData.add(data.copyOf())
+		if (hangWrite) awaitCancellation()
 	}
 
 	override suspend fun requestMtu(mtu: Int): Int {
