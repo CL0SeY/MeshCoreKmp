@@ -2,13 +2,21 @@
 
 package com.darkrockstudios.libs.meshcore
 
+import com.darkrockstudios.libs.meshcore.ble.BleAdapter
+import com.darkrockstudios.libs.meshcore.ble.BleConnection
 import com.darkrockstudios.libs.meshcore.ble.ConnectionState
 import com.darkrockstudios.libs.meshcore.ble.DiscoveredDevice
 import com.darkrockstudios.libs.meshcore.ble.MeshCoreBleException
 import com.darkrockstudios.libs.meshcore.ble.ScanFilter
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
@@ -85,6 +93,51 @@ class DeviceScannerTest {
 		scanner.startScan(scope = backgroundScope)
 		scanner.stopScan()
 		assertTrue(adapter.scanStopped)
+	}
+
+	/**
+	 * INVARIANT: after `stopScan()` + `startScan()`, the new scan's collection of the
+	 * adapter flow must not begin until the previous collection has completed (its
+	 * `awaitClose` cleanup ran). The real adapter's cleanup is `blueFalcon.stopScanning()`,
+	 * so collecting the new flow before the old one has finished cleaning up lets a stale
+	 * cleanup stop the scan that just started.
+	 *
+	 * The two scans run on different dispatchers to make the ordering observable: the
+	 * first collection is parked on a [StandardTestDispatcher], so cancelling it queues
+	 * its cleanup rather than running it, and the restart's [UnconfinedTestDispatcher]
+	 * would collect eagerly — a second `collect-start` before the previous `cleanup` —
+	 * unless `startScan()` joins the previous job first.
+	 *
+	 * [LifecycleRecordingBleAdapter.stopScan] is a no-op, so this fake never models the
+	 * platform stop (`blueFalcon.stopScanning()`): the assertion is an ordering proxy for
+	 * that hazard, not a reproduction of it.
+	 */
+	@Test
+	fun startScan_waitsForPreviousCollectionToCleanUp() = runTest {
+		val adapter = LifecycleRecordingBleAdapter()
+		val scanner = DeviceScanner(adapter)
+
+		val firstScope = CoroutineScope(StandardTestDispatcher(testScheduler))
+		scanner.startScan(scope = firstScope)
+		// The first collection only begins once the standard dispatcher runs.
+		testScheduler.advanceUntilIdle()
+		assertEquals(listOf("collect-start"), adapter.events)
+
+		// stopScan() cancels without joining, so the cleanup is queued, not run.
+		scanner.stopScan()
+
+		val secondScope = CoroutineScope(UnconfinedTestDispatcher(testScheduler))
+		scanner.startScan(scope = secondScope)
+		testScheduler.advanceUntilIdle()
+
+		assertEquals(
+			listOf("collect-start", "cleanup", "collect-start"),
+			adapter.events,
+			"the new collection began before the previous one's cleanup ran: ${adapter.events}",
+		)
+
+		firstScope.cancel()
+		secondScope.cancel()
 	}
 
 	@Test
@@ -169,4 +222,27 @@ class DeviceScannerTest {
 	)
 
 	private val sampleDevice = DiscoveredDevice("dev1", "Radio A", -50)
+}
+
+/**
+ * Records the collection lifecycle of [scan]: it returns a cold `callbackFlow` that
+ * appends `"collect-start"` when collection begins and `"cleanup"` when the collection
+ * ends (its `awaitClose` block, the real adapter's `stopScanning()` slot), so the order
+ * of [events] is the order a collector actually observed.
+ */
+private class LifecycleRecordingBleAdapter : BleAdapter {
+	val events = mutableListOf<String>()
+
+	override var isBluetoothEnabled: Boolean = true
+
+	override fun scan(filter: ScanFilter): Flow<DiscoveredDevice> =
+		callbackFlow {
+			events += "collect-start"
+			trySend(DiscoveredDevice("dev1", "Radio A", -50))
+			awaitClose { events += "cleanup" }
+		}
+
+	override fun stopScan() = Unit
+
+	override suspend fun connect(device: DiscoveredDevice): BleConnection = error("scan-only fake")
 }
