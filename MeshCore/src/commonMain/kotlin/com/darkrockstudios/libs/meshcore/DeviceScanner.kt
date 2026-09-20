@@ -25,11 +25,17 @@ class DeviceScanner(
 	private var scanJob: Job? = null
 
 	fun startScan(filter: ScanFilter = ScanFilter(), scope: CoroutineScope) {
+		// Capture the previous job before stopScan(): its cancelled collector
+		// runs the adapter's awaitClose cleanup asynchronously, which would
+		// otherwise stop the scan this call is about to start. stopScan() keeps
+		// the job, so joining it below orders this restart behind that cleanup.
+		val previousScan = scanJob
 		stopScan()
 		_discoveredDevices.value = emptyList()
 		Napier.d(tag = TAG) { "startScan() called" }
 		val scanFlow = bleAdapter.scan(filter)
 		scanJob = scope.launch {
+			previousScan?.join()
 			Napier.d(tag = TAG) { "Collecting scan flow" }
 			scanFlow.collect { device ->
 				Napier.d(tag = TAG) { "Received device '${device.name}' (${device.identifier})" }
@@ -46,8 +52,11 @@ class DeviceScanner(
 	}
 
 	fun stopScan() {
+		// scanJob is deliberately NOT cleared: it means "most recent collection
+		// job, possibly cancelled". startScan() joins it so the restart is
+		// ordered behind this collector's adapter cleanup, which would otherwise
+		// stop the scan it starts.
 		scanJob?.cancel()
-		scanJob = null
 		bleAdapter.stopScan()
 	}
 
