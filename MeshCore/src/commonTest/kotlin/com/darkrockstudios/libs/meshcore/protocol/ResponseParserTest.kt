@@ -6,6 +6,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class ResponseParserTest {
 
@@ -161,6 +162,28 @@ class ResponseParserTest {
         val result = ResponseParser.parse(byteArrayOf(0x12, 0x02))
         assertIs<Response.ChannelInfo>(result)
         assertEquals("", result.secret)
+    }
+
+    @Test
+    fun parse_channelInfo_nameCutMidCodepoint_keepsChannelWithReplacementChar() {
+        // The node stores a raw 32-byte copy of the name field, so a longer
+        // name is cut mid-sequence. The channel must survive with a leniently
+        // decoded name — never dropped, never thrown on.
+        val nameBytes = ("Node " + "🐼".repeat(10)).encodeToByteArray()
+        assertEquals(45, nameBytes.size)
+        val data = ByteArray(50)
+        data[0] = 0x12
+        data[1] = 0x09 // channel index 9
+        nameBytes.copyInto(data, 2, 0, 32) // raw 32-byte copy, no NUL terminator
+        for (i in 0 until 16) data[34 + i] = (0x10 + i).toByte()
+
+        val result = ResponseParser.parse(data)
+        assertIs<Response.ChannelInfo>(result)
+        assertEquals(9, result.index)
+        assertTrue(result.name.isNotBlank())
+        assertTrue(result.name.startsWith("Node "))
+        assertTrue(result.name.endsWith('\uFFFD'))
+        assertEquals("101112131415161718191a1b1c1d1e1f", result.secret)
     }
 
 	@Test

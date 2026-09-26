@@ -5,6 +5,7 @@ import com.darkrockstudios.libs.meshcore.ble.ConnectionState
 import com.darkrockstudios.libs.meshcore.model.*
 import com.darkrockstudios.libs.meshcore.protocol.CommandQueue
 import com.darkrockstudios.libs.meshcore.protocol.CommandSerializer
+import com.darkrockstudios.libs.meshcore.protocol.MAX_GROUP_CHANNELS
 import com.darkrockstudios.libs.meshcore.protocol.Response
 import io.github.aakira.napier.Napier
 import kotlinx.coroutines.CancellationException
@@ -23,6 +24,13 @@ import kotlinx.coroutines.yield
  * flood on the slowest spreading factor estimates well under two minutes.
  */
 private const val MAX_ACK_WAIT_MILLIS = 120_000L
+
+/**
+ * Slots to fetch when no DEVICE_QUERY answer has landed yet: the eight the
+ * channel fetch asked for before the advertised capacity was honoured, so an
+ * unqueried node is asked for neither more nor fewer.
+ */
+private const val DEFAULT_CHANNEL_SLOTS = 8
 
 class DeviceConnection internal constructor(
 	private val bleConnection: BleConnection,
@@ -124,8 +132,12 @@ class DeviceConnection internal constructor(
 		}
 
 		if (config.autoFetchChannels) {
-			val maxChannels = deviceInfoResp.maxChannels.coerceIn(1, 8)
+			val maxChannels = advertisedChannelSlotCount()
 			val channelList = mutableListOf<Channel>()
+			// Ask for every slot below the advertised capacity, empty ones
+			// included: slots are written and cleared independently, so the
+			// channels in use can sit anywhere and a hole must not stop the
+			// fetch short of the slots above it.
 			for (i in 0 until maxChannels) {
 				val ch = getChannel(i)
 				channelList.add(ch)
@@ -178,6 +190,19 @@ class DeviceConnection internal constructor(
 
 	// --- Channels ---
 
+	/**
+	 * Slot count to fetch: the capacity DEVICE_QUERY advertised, capped at
+	 * [MAX_GROUP_CHANNELS]. A reported 0 — a legacy or short frame carrying no
+	 * capacity — keeps the single-slot behaviour, and a real capacity is never
+	 * exceeded: a slot at or above it answers ERR, which would fail the
+	 * connect. Before any DEVICE_QUERY answer (null device info) fall back to
+	 * [DEFAULT_CHANNEL_SLOTS] rather than one slot: slots are written
+	 * independently, so under-asking loses channels while over-asking only
+	 * reads a zeroed slot.
+	 */
+	private fun advertisedChannelSlotCount(): Int =
+		(_deviceInfo.value?.maxChannels ?: DEFAULT_CHANNEL_SLOTS).coerceIn(1, MAX_GROUP_CHANNELS)
+
 	suspend fun getChannel(index: Int): Channel {
 		val resp = commandQueue.execute<Response.ChannelInfo>(
 			CommandSerializer.getChannel(index),
@@ -187,7 +212,7 @@ class DeviceConnection internal constructor(
 	}
 
 	suspend fun getAllChannels(): List<Channel> {
-		val maxChannels = _deviceInfo.value?.maxChannels?.coerceIn(1, 8) ?: 8
+		val maxChannels = advertisedChannelSlotCount()
 		val channelList = mutableListOf<Channel>()
 		for (i in 0 until maxChannels) {
 			channelList.add(getChannel(i))
