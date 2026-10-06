@@ -60,7 +60,7 @@ class BleIntegrationTest {
 	fun connectAndRunBasicCommands() = runBlocking {
 		val app = InstrumentationRegistry.getInstrumentation().targetContext.applicationContext as Application
 		val blueFalcon = BlueFalcon(context = app)
-		val adapter = BlueFalconBleAdapter(blueFalcon)
+		val adapter = BlueFalconBleAdapter(blueFalcon, platformAppContext = app)
 		val scanner = DeviceScanner(adapter)
 
 		scope = CoroutineScope(Dispatchers.Default + SupervisorJob())

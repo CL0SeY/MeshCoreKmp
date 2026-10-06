@@ -8,6 +8,7 @@ interface BleConnection {
 	val incomingData: Flow<ByteArray>
 	suspend fun write(data: ByteArray)
 	suspend fun requestMtu(mtu: Int): Int
+	suspend fun requestConnectionPriority(priority: ConnectionPriority): Boolean
 	suspend fun disconnect()
 	val deviceIdentifier: String
 }

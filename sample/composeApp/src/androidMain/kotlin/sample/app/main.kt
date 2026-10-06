@@ -33,7 +33,7 @@ class AppActivity : ComponentActivity() {
 		enableEdgeToEdge()
 		Napier.base(DebugAntilog())
 		val blueFalcon = BlueFalcon(context = application)
-		bleAdapter = BlueFalconBleAdapter(blueFalcon)
+		bleAdapter = BlueFalconBleAdapter(blueFalcon, platformAppContext = application)
 
 		if (hasRequiredPermissions()) {
 			showApp()

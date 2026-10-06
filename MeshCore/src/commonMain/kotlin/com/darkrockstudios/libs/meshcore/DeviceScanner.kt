@@ -7,10 +7,12 @@ import com.darkrockstudios.libs.meshcore.protocol.CommandQueue
 import io.github.aakira.napier.Napier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class DeviceScanner(
 	private val bleAdapter: BleAdapter,
@@ -23,11 +25,17 @@ class DeviceScanner(
 	private var scanJob: Job? = null
 
 	fun startScan(filter: ScanFilter = ScanFilter(), scope: CoroutineScope) {
+		// Capture the previous job before stopScan(): its cancelled collector
+		// runs the adapter's awaitClose cleanup asynchronously, which would
+		// otherwise stop the scan this call is about to start. stopScan() keeps
+		// the job, so joining it below orders this restart behind that cleanup.
+		val previousScan = scanJob
 		stopScan()
 		_discoveredDevices.value = emptyList()
 		Napier.d(tag = TAG) { "startScan() called" }
 		val scanFlow = bleAdapter.scan(filter)
 		scanJob = scope.launch {
+			previousScan?.join()
 			Napier.d(tag = TAG) { "Collecting scan flow" }
 			scanFlow.collect { device ->
 				Napier.d(tag = TAG) { "Received device '${device.name}' (${device.identifier})" }
@@ -44,8 +52,11 @@ class DeviceScanner(
 	}
 
 	fun stopScan() {
+		// scanJob is deliberately NOT cleared: it means "most recent collection
+		// job, possibly cancelled". startScan() joins it so the restart is
+		// ordered behind this collector's adapter cleanup, which would otherwise
+		// stop the scan it starts.
 		scanJob?.cancel()
-		scanJob = null
 		bleAdapter.stopScan()
 	}
 
@@ -55,25 +66,49 @@ class DeviceScanner(
 		config: ConnectionConfig = ConnectionConfig(),
 	): DeviceConnection {
 		stopScan()
+		Napier.d(tag = TAG) {
+			"connect(): ${device.identifier} mtu=${config.requestedMtu} commandTimeout=${config.commandTimeout}"
+		}
 
 		val bleConnection = bleAdapter.connect(device)
-		bleConnection.requestMtu(config.requestedMtu)
+		var deviceConnection: DeviceConnection? = null
+		var handedOff = false
+		try {
+			bleConnection.requestMtu(config.requestedMtu)
+			config.connectionPriority?.let { bleConnection.requestConnectionPriority(it) }
 
-		val commandQueue = CommandQueue(
-			connection = bleConnection,
-			scope = scope,
-			defaultTimeout = config.commandTimeout,
-		)
+			val commandQueue = CommandQueue(
+				connection = bleConnection,
+				scope = scope,
+				defaultTimeout = config.commandTimeout,
+			)
 
-		val connection = DeviceConnection(
-			bleConnection = bleConnection,
-			commandQueue = commandQueue,
-			scope = scope,
-			config = config,
-		)
-
-		connection.initialize()
-		return connection
+			val established = DeviceConnection(
+				bleConnection = bleConnection,
+				commandQueue = commandQueue,
+				scope = scope,
+				config = config,
+			)
+			deviceConnection = established
+			established.initialize()
+			handedOff = true
+			return established
+		} finally {
+			if (!handedOff) {
+				// connect() already owns a GATT. If MTU, handshake, or
+				// cancellation fails here the caller never gets a
+				// DeviceConnection to disconnect — leftover clients wedge
+				// Wear until airplane mode.
+				withContext(NonCancellable) {
+					val wrapped = deviceConnection
+					if (wrapped != null) {
+						runCatching { wrapped.disconnect() }
+					} else {
+						runCatching { bleConnection.disconnect() }
+					}
+				}
+			}
+		}
 	}
 
 	companion object {
