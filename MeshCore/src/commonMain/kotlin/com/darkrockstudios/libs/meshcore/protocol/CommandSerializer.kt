@@ -1,5 +1,8 @@
 package com.darkrockstudios.libs.meshcore.protocol
 
+/** Largest channel-slot capacity any firmware variant advertises in DEVICE_QUERY byte 3 (40 today): raise it if a variant ever exceeds that. */
+internal const val MAX_GROUP_CHANNELS = 40
+
 object CommandSerializer {
 
 	fun appStart(appName: String = "mccli"): ByteArray {
@@ -31,24 +34,30 @@ object CommandSerializer {
 	}
 
 	fun getChannel(index: Int): ByteArray {
-		require(index in 0..7) { "Channel index must be 0-7" }
+		require(index in 0 until MAX_GROUP_CHANNELS) { "Channel index must be 0-39" }
 		return byteArrayOf(CommandCode.GET_CHANNEL.toByte(), index.toByte())
 	}
 
+	/**
+	 * `CMD_SET_CHANNEL`. The frame is sized by the secret so both firmware
+	 * forms are covered: a 16-byte secret gives the 50-byte frame this
+	 * firmware writes (MyMesh.cpp:1899-1904), a 32-byte secret the 66-byte
+	 * frame other variants take.
+	 */
 	fun setChannel(index: Int, name: String, secret: ByteArray): ByteArray {
-		require(secret.size == 32) { "Secret must be 32 bytes" }
-		require(index in 0..7) { "Channel index must be 0-7" }
-		val buffer = ByteArray(66)
+		require(secret.size == 16 || secret.size == 32) { "Secret must be 16 or 32 bytes" }
+		require(index in 0 until MAX_GROUP_CHANNELS) { "Channel index must be 0-39" }
+		val buffer = ByteArray(2 + 32 + secret.size)
 		buffer[0] = CommandCode.SET_CHANNEL.toByte()
 		buffer[1] = index.toByte()
-		val nameBytes = name.encodeToByteArray()
-		nameBytes.copyInto(buffer, 2, 0, minOf(nameBytes.size, 32))
+		val nameBytes = truncateUtf8(name.encodeToByteArray(), 32)
+		nameBytes.copyInto(buffer, 2)
 		secret.copyInto(buffer, 34)
 		return buffer
 	}
 
 	fun deleteChannel(index: Int): ByteArray =
-		setChannel(index, "", ByteArray(32))
+		setChannel(index, "", ByteArray(16))
 
 	fun sendDirectMessage(
 		publicKeyPrefix: ByteArray,
@@ -69,7 +78,7 @@ object CommandSerializer {
 	}
 
 	fun sendChannelMessage(channelIndex: Int, text: String, timestampSeconds: Long): ByteArray {
-		require(channelIndex in 0..7) { "Channel index must be 0-7" }
+		require(channelIndex in 0 until MAX_GROUP_CHANNELS) { "Channel index must be 0-39" }
 		val textBytes = text.encodeToByteArray()
 		val buffer = ByteArray(7 + textBytes.size)
 		buffer[0] = CommandCode.SEND_CHANNEL_MESSAGE.toByte()

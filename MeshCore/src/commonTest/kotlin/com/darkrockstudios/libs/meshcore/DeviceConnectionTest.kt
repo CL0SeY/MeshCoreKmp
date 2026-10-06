@@ -35,12 +35,12 @@ class DeviceConnectionTest {
 		return data
 	}
 
-	private fun createDeviceInfoResponse(): ByteArray {
+	private fun createDeviceInfoResponse(maxChannels: Int = 8): ByteArray {
 		val data = ByteArray(80)
 		data[0] = 0x0D
 		data[1] = 0x03 // firmware v3
 		data[2] = 0x04 // max contacts raw=4, actual=8
-		data[3] = 0x08 // max channels=8
+		data[3] = maxChannels.toByte() // what the firmware advertises as its slot count
 		data[4] = 0xD2.toByte(); data[5] = 0x04; data[6] = 0x00; data[7] = 0x00 // PIN=1234
 		"1.0.0".encodeToByteArray().copyInto(data, 8)
 		"TestRadio".encodeToByteArray().copyInto(data, 20)
@@ -56,9 +56,19 @@ class DeviceConnectionTest {
         val data = ByteArray(if (secret.isEmpty()) 34 else 50)
         data[0] = 0x12
         data[1] = index.toByte()
-        name.encodeToByteArray().copyInto(data, 2, 0, minOf(name.length, 32))
+        // Raw byte copy, the way the node stores the field: cutting by chars
+        // mangles any multi-byte name (9 chars / 12 bytes lost its panda).
+        val nameBytes = name.encodeToByteArray()
+        nameBytes.copyInto(data, 2, 0, minOf(nameBytes.size, 32))
         if (secret.isNotEmpty()) secret.copyInto(data, 34)
         return data
+    }
+
+    /** The node's answer to `GET_CHANNEL [slot]`: empty slots come back zeroed. */
+    private fun channelSlotResponse(slot: Int): ByteArray = when (slot) {
+        0 -> createChannelInfoResponse(0, "Public", ByteArray(16) { (it + 1).toByte() })
+        9 -> createChannelInfoResponse(9, "Private", ByteArray(16) { (it + 0x20).toByte() })
+        else -> createChannelInfoResponse(slot, "", ByteArray(16))
     }
 
 	/** A 0x03 contact frame with a flood path and [lastmod] in the trailing field. */
@@ -165,6 +175,101 @@ class DeviceConnectionTest {
         assertEquals("General", channel.name)
         assertEquals("000102030405060708090a0b0c0d0e0f", channel.secret)
     }
+
+	@Test
+	fun initialize_fetchesEveryAdvertisedSlot() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = true,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		// The node advertises 40 slots in DEVICE_QUERY byte 3 and answers
+		// GET_CHANNEL for every one of them — empty slots come back zeroed.
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse(maxChannels = 40))
+			for (slot in 0 until 40) {
+				while (bleConnection.writtenData.size < 3 + slot) { kotlinx.coroutines.yield() }
+				bleConnection.simulateResponse(channelSlotResponse(slot))
+			}
+		}
+
+		connection.initialize()
+
+		assertEquals(40, connection.channels.value.size)
+
+		val slotNine = connection.channels.value.firstOrNull { it.index == 9 }
+		assertNotNull(slotNine)
+		assertEquals("Private", slotNine.name)
+		assertEquals("202122232425262728292a2b2c2d2e2f", slotNine.secret)
+
+		// Every slot below the advertised capacity was actually requested, in
+		// order, including the 38 the node answers with a zeroed frame.
+		val channelRequests =
+			bleConnection.writtenData.filter { it[0] == 0x1F.toByte() }.map { it[1].toInt() }
+		assertEquals((0 until 40).toList(), channelRequests)
+		assertEquals(38, connection.channels.value.count { it.name.isBlank() })
+	}
+
+	@Test
+	fun initialize_keepsChannelAboveSlotSeven() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = true,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse(maxChannels = 40))
+			for (slot in 0 until 40) {
+				while (bleConnection.writtenData.size < 3 + slot) { kotlinx.coroutines.yield() }
+				bleConnection.simulateResponse(channelSlotResponse(slot))
+			}
+		}
+
+		connection.initialize()
+
+		// The channels the node holds are exactly slots 0 and 9: a fetch that
+		// stops at slot 7 loses every channel the user created above it.
+		val named = connection.channels.value.filterNot { it.name.isBlank() }
+		assertEquals(listOf(0, 9), named.map { it.index })
+		assertEquals(listOf("Public", "Private"), named.map { it.name })
+		assertEquals(40, connection.channels.value.size)
+	}
 
 	@Test
 	fun pollNextMessage_noMessages() = runTest {
