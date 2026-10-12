@@ -2,6 +2,7 @@
 
 package com.darkrockstudios.libs.meshcore
 
+import com.darkrockstudios.libs.meshcore.model.DrainReport
 import com.darkrockstudios.libs.meshcore.model.ReceivedBinaryResponse
 import com.darkrockstudios.libs.meshcore.model.ReceivedRawData
 import com.darkrockstudios.libs.meshcore.protocol.CommandQueue
@@ -12,7 +13,9 @@ import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 class DeviceConnectionTest {
 
@@ -679,26 +682,20 @@ class DeviceConnectionTest {
 		val observed = mutableListOf<Int>()
 		val collectJob = launch { connection.messagesWaiting.collect { observed.add(it.count) } }
 		testScheduler.advanceUntilIdle()
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		testScheduler.advanceUntilIdle()
 
-		// A single push proves the contract that matters for the app: the
-		// flow observes the push, and the observation itself issues no
-		// GET_MESSAGE — the auto-drain owns the only fetch. The earlier
-		// two-push form of this test kept failing on scheduler mechanics, not
-		// library behaviour: a second 0x83 arriving while the first push's
-		// drain still runs may never surface as a separate emission (extra
-		// buffer 64, but the collector chain behind advanceUntilIdle does not
-		// advance it) — and the doc contract is trigger-based, not
-		// arrival-counted, so a single push is the whole contract.
+		// Two pushes with different counts: the flow observes both, and the
+		// observation itself issues no GET_MESSAGE — the auto-drain owns the
+		// fetches. The responder answers by sticky write-count: each new
+		// 0x0A byte in the log earns one 0x0A reply, for exactly two fetches
+		// (one per push).
 		var servedFetches = 0
 		val drainResponder = launch {
 			var answered = 0
-			// Finite: the single push earns exactly one GET_MESSAGE fetch,
-			// then this returns so advanceUntilIdle can go idle. An infinite
-			// yield loop never idles — that wedged every earlier version of
-			// this test. The spin cap keeps a shortfall from hanging the
-			// scheduler; the assertion below reports it instead.
 			var spins = 0
-			while (answered < 1 && spins < 10_000) {
+			while (answered < 2 && spins < 10_000) {
 				val writes = bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
 				while (answered < writes) {
 					answered++
@@ -710,14 +707,179 @@ class DeviceConnectionTest {
 			}
 		}
 		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x02))
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		// Foreground spinner: the drains run in backgroundScope, and
+		// advanceUntilIdle stops as soon as only background events remain
+		// (its stop condition is "no foreground events"), which starved every
+		// earlier version of this test exactly while the drain was resuming.
+		// The spinner (launched from this foreground test body) re-queues a
+		// foreground delay(1) event until both drains report, keeping the
+		// pump alive; the spin cap turns a regression into an assertion
+		// failure instead of a hang.
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 4 && spinnerSpins < 10_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
 		testScheduler.advanceUntilIdle()
+		spinner.cancel()
 		drainResponder.cancel()
 		collectJob.cancel()
 
-		assertEquals(listOf(2), observed)
-		// No collector of messagesWaiting may fetch: the GET_MESSAGE write
-		// came from the library's own auto-drain.
-		assertEquals(1, servedFetches)
+		assertEquals(listOf(2, 1), observed)
+		// No collector of messagesWaiting may fetch: the two GET_MESSAGE
+		// writes came from the library's own auto-drain — one per push.
+		assertEquals(2, servedFetches)
+		// Each push brackets its own drain: Started carries the node's push
+		// count, then exactly one terminal report. The NoMoreMessages
+		// answers mean zero delivered, and neither collector fetched.
+		assertEquals(
+			listOf(
+				DrainReport.Started("push", 2),
+				DrainReport.Completed("push", 0),
+				DrainReport.Started("push", 1),
+				DrainReport.Completed("push", 0),
+			),
+			reports,
+		)
+		reportJob.cancel()
+	}
+
+	@Test
+	fun drainReports_failedPushDrainNamesReason() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		testScheduler.advanceUntilIdle()
+
+		// No answer to the drain's GET_MESSAGE: the 10s command timeout must
+		// surface as Failed with the reason and the delivered count so far —
+		// a start with an explicit failure, never a silent start.
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		// Foreground spinner (see the test above): it also advances virtual
+		// time via delay(1) so the unanswered GET_MESSAGE's 10s timeout
+		// fires; the 30s cap bounds a regression into an assertion failure.
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 2 && spinnerSpins < 30_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+
+		assertEquals(2, reports.size)
+		assertEquals(DrainReport.Started("push", 1), reports.first())
+		val failed = reports.last()
+		assertIs<DrainReport.Failed>(failed)
+		assertEquals("push", failed.trigger)
+		assertEquals(0, failed.delivered)
+		assertTrue(failed.reason.contains("timed out"), "reason=${failed.reason}")
+		reportJob.cancel()
+	}
+
+	@Test
+	fun drainReports_neverStallTheDrain() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		// A consumer that takes one report and then stops consuming forever
+		// (awaitCancellation schedules no timer, so it cannot keep the
+		// scheduler alive). With a suspending emit, the tenth report would
+		// back up behind the 8-slot buffer and park the push listener
+		// mid-drain; tryEmit drops instead, so every drain still finishes.
+		val stalledConsumer = launch {
+			connection.drainReports.collect { kotlinx.coroutines.awaitCancellation() }
+		}
+		testScheduler.advanceUntilIdle()
+
+		val pushes = 10
+		var servedFetches = 0
+		val drainResponder = launch {
+			var answered = 0
+			var spins = 0
+			while (answered < pushes && spins < 20_000) {
+				val writes = bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+				while (answered < writes) {
+					answered++
+					servedFetches++
+					bleConnection.simulateResponse(byteArrayOf(0x0A))
+				}
+				spins++
+				kotlinx.coroutines.yield()
+			}
+		}
+		repeat(pushes) { bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01)) }
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (servedFetches < pushes && spinnerSpins < 30_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+		drainResponder.cancel()
+		stalledConsumer.cancel()
+
+		assertEquals(pushes, servedFetches)
 	}
 
 	@Test

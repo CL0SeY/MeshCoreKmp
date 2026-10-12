@@ -11,6 +11,7 @@ import io.github.aakira.napier.Napier
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.channels.Channel as CoroutineChannel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -55,6 +56,12 @@ class DeviceConnection internal constructor(
 
 	private val _incomingMessages = MutableSharedFlow<ReceivedMessage>(extraBufferCapacity = 64)
 	val incomingMessages: Flow<ReceivedMessage> = _incomingMessages.asSharedFlow()
+
+	private val _drainReports =
+		MutableSharedFlow<DrainReport>(
+			extraBufferCapacity = 8,
+			onBufferOverflow = BufferOverflow.DROP_OLDEST,
+		)
 
 	val acks: Flow<String> = commandQueue.pushEvents
 		.filterIsInstance<Response.Ack>()
@@ -116,14 +123,31 @@ class DeviceConnection internal constructor(
 	 * [Response.MessagesWaiting.count] messages for this client.
 	 * Observation-only: the auto-drain inside [initialize] performs the same
 	 * [pollNextMessage] loop, so collectors of this flow MUST NOT fetch.
-	 * A push means "drain now", nothing more: a second push arriving while
-	 * the first push's drain still runs may never surface as a separate
-	 * emission, so consumers MUST NOT count arrivals — key on the count
-	 * (e.g. only treat a larger count than the last observed one as new),
-	 * and treat any emission as a drain trigger.
+	 * A push means "drain now", nothing more: pushes arriving while a drain
+	 * runs queue behind it (pushEvents buffers 64) and each still triggers
+	 * its own drain in turn, so every push surfaces as a separate emission.
+	 * Consumers should nonetheless key on the count rather than arrival
+	 * order (e.g. only treat a larger count than the last observed one as
+	 * new), and treat any emission as a drain trigger.
 	 */
 	val messagesWaiting: Flow<Response.MessagesWaiting> = commandQueue.pushEvents
 		.filterIsInstance<Response.MessagesWaiting>()
+
+	/**
+	 * Lifecycle of the library's own drains: one [DrainReport.Started] before
+	 * the first fetch, then exactly one [DrainReport.Completed] or
+	 * [DrainReport.Failed] per drain — unless the drain is cancelled, in
+	 * which case the [DrainReport.Started] has no terminal (a cancel is
+	 * start-with-no-terminal, the interrupted-drain signature, never a
+	 * [DrainReport.Failed]). The host's wake log brackets its own
+	 * connect-path drain; this flow brackets the push drain, so a missing
+	 * message reads as start-with-no-done (or an explicit failure) instead of
+	 * silence. Observation-only: reports never fetch, and reporting never
+	 * stalls a drain — emissions use tryEmit with a small buffer (8), so a
+	 * stalled consumer loses the oldest unread report instead of parking the
+	 * push listener, and with no consumer at all reports are discarded.
+	 */
+	val drainReports: Flow<DrainReport> = _drainReports.asSharedFlow()
 
 	internal suspend fun initialize() {
 		// 1. APP_START — returns SelfInfo
@@ -160,20 +184,20 @@ class DeviceConnection internal constructor(
 		}
 
 		if (config.autoPollMessages) {
-			drainMessages()
+			drainMessages(trigger = "init")
 		}
 
 		// Setup message waiting listener
 		scope.launch {
 			commandQueue.pushEvents
 				.filterIsInstance<Response.MessagesWaiting>()
-				.collect {
+				.collect { waiting ->
 					// A stalled GET_MESSAGE (10s command timeout) must drop
 					// this drain, never the scope: the scope belongs to the
 					// host app (main thread on Android), where an uncaught
 					// throw kills the process and eats later pushes.
 					try {
-						drainMessages()
+						drainMessages(trigger = "push", waiting = waiting.count)
 					} catch (cancelled: CancellationException) {
 						throw cancelled
 					} catch (error: Exception) {
@@ -335,11 +359,28 @@ class DeviceConnection internal constructor(
 		}
 	}
 
-	private suspend fun drainMessages() {
-		while (true) {
-			val msg = pollNextMessage() ?: break
-			_incomingMessages.emit(msg)
+	private suspend fun drainMessages(trigger: String, waiting: Int? = null) {
+		_drainReports.tryEmit(DrainReport.Started(trigger, waiting))
+		var delivered = 0
+		try {
+			while (true) {
+				val msg = pollNextMessage() ?: break
+				_incomingMessages.emit(msg)
+				delivered++
+			}
+		} catch (cancelled: CancellationException) {
+			throw cancelled
+		} catch (error: Exception) {
+			_drainReports.tryEmit(
+				DrainReport.Failed(
+					trigger = trigger,
+					delivered = delivered,
+					reason = error.message ?: error::class.simpleName ?: "unknown",
+				),
+			)
+			throw error
 		}
+		_drainReports.tryEmit(DrainReport.Completed(trigger, delivered))
 	}
 
 	// --- Raw Data / Binary ---
