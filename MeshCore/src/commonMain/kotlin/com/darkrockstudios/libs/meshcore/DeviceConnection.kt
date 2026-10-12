@@ -111,6 +111,20 @@ class DeviceConnection internal constructor(
 		.filterIsInstance<Response.ContactDeleted>()
 		.map { it.publicKeyPrefix }
 
+	/**
+	 * `PUSH_CODE_MSG_WAITING` (0x83) pushes: the node's offline queue holds
+	 * [Response.MessagesWaiting.count] messages for this client.
+	 * Observation-only: the auto-drain inside [initialize] performs the same
+	 * [pollNextMessage] loop, so collectors of this flow MUST NOT fetch.
+	 * A push means "drain now", nothing more: a second push arriving while
+	 * the first push's drain still runs may never surface as a separate
+	 * emission, so consumers MUST NOT count arrivals — key on the count
+	 * (e.g. only treat a larger count than the last observed one as new),
+	 * and treat any emission as a drain trigger.
+	 */
+	val messagesWaiting: Flow<Response.MessagesWaiting> = commandQueue.pushEvents
+		.filterIsInstance<Response.MessagesWaiting>()
+
 	internal suspend fun initialize() {
 		// 1. APP_START — returns SelfInfo
 		val selfInfoResp = commandQueue.execute<Response.SelfInfo>(

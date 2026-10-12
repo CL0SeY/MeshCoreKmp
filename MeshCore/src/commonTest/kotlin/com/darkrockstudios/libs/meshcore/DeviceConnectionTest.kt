@@ -646,6 +646,81 @@ class DeviceConnectionTest {
 	}
 
 	@Test
+	fun messagesWaiting_flowObservesPushWithoutFetching() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val observed = mutableListOf<Int>()
+		val collectJob = launch { connection.messagesWaiting.collect { observed.add(it.count) } }
+		testScheduler.advanceUntilIdle()
+
+		// A single push proves the contract that matters for the app: the
+		// flow observes the push, and the observation itself issues no
+		// GET_MESSAGE — the auto-drain owns the only fetch. The earlier
+		// two-push form of this test kept failing on scheduler mechanics, not
+		// library behaviour: a second 0x83 arriving while the first push's
+		// drain still runs may never surface as a separate emission (extra
+		// buffer 64, but the collector chain behind advanceUntilIdle does not
+		// advance it) — and the doc contract is trigger-based, not
+		// arrival-counted, so a single push is the whole contract.
+		var servedFetches = 0
+		val drainResponder = launch {
+			var answered = 0
+			// Finite: the single push earns exactly one GET_MESSAGE fetch,
+			// then this returns so advanceUntilIdle can go idle. An infinite
+			// yield loop never idles — that wedged every earlier version of
+			// this test. The spin cap keeps a shortfall from hanging the
+			// scheduler; the assertion below reports it instead.
+			var spins = 0
+			while (answered < 1 && spins < 10_000) {
+				val writes = bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+				while (answered < writes) {
+					answered++
+					servedFetches++
+					bleConnection.simulateResponse(byteArrayOf(0x0A))
+				}
+				spins++
+				kotlinx.coroutines.yield()
+			}
+		}
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x02))
+		testScheduler.advanceUntilIdle()
+		drainResponder.cancel()
+		collectJob.cancel()
+
+		assertEquals(listOf(2), observed)
+		// No collector of messagesWaiting may fetch: the GET_MESSAGE write
+		// came from the library's own auto-drain.
+		assertEquals(1, servedFetches)
+	}
+
+	@Test
 	fun getContactsSince_returnsStreamedDeltaWithStreamCursor() = runTest {
 		val bleConnection = FakeBleConnection()
 		val queue = CommandQueue(
