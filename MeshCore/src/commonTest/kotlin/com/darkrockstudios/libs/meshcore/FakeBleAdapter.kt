@@ -30,7 +30,14 @@ class FakeBleAdapter(
 		scanChannel.close()
 	}
 
-	override suspend fun connect(device: DiscoveredDevice): BleConnection {
+	/** The autoConnect flag of the most recent [connect] call. */
+	var lastConnectAutoConnect: Boolean? = null
+
+	override suspend fun connect(
+		device: DiscoveredDevice,
+		autoConnect: Boolean,
+	): BleConnection {
+		lastConnectAutoConnect = autoConnect
 		return fakeConnection
 	}
 

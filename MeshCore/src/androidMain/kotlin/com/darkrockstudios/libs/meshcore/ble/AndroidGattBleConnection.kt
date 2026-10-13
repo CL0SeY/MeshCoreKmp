@@ -41,6 +41,14 @@ internal class AndroidGattBleConnection private constructor(
 	private val context: Context,
 	private val device: BluetoothDevice,
 	override val deviceIdentifier: String,
+	/**
+	 * Opportunistic connect mode: `connectGatt` keeps the attempt armed while
+	 * this process lives and completes it when the peripheral appears, rather
+	 * than failing when a direct attempt gives up early. The attempt is still
+	 * bounded by [CONNECT_TIMEOUT_MS] and the GATT is still closed on give-up
+	 * or cancellation, so it cannot outlive the attempt.
+	 */
+	private val autoConnect: Boolean,
 ) : BleConnection {
 
 	companion object {
@@ -57,12 +65,14 @@ internal class AndroidGattBleConnection private constructor(
 			context: Context,
 			device: BluetoothDevice,
 			deviceIdentifier: String,
+			autoConnect: Boolean = false,
 		): AndroidGattBleConnection {
 			val connection =
 				AndroidGattBleConnection(
 					context = context.applicationContext,
 					device = device,
 					deviceIdentifier = deviceIdentifier,
+					autoConnect = autoConnect,
 				)
 			connection.connectAndSetup()
 			return connection
@@ -307,7 +317,7 @@ internal class AndroidGattBleConnection private constructor(
 						val opened =
 							device.connectGatt(
 								context,
-								false,
+								autoConnect,
 								callback,
 								BluetoothDevice.TRANSPORT_LE,
 							)

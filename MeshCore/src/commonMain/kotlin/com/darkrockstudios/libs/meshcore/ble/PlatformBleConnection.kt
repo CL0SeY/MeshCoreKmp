@@ -17,4 +17,5 @@ internal expect suspend fun platformOpenBleConnection(
 	peripheral: BluetoothPeripheral,
 	deviceIdentifier: String,
 	platformAppContext: Any?,
+	autoConnect: Boolean,
 ): BleConnection

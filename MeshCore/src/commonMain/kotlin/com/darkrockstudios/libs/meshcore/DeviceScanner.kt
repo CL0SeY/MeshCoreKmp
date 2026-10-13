@@ -70,7 +70,7 @@ class DeviceScanner(
 			"connect(): ${device.identifier} mtu=${config.requestedMtu} commandTimeout=${config.commandTimeout}"
 		}
 
-		val bleConnection = bleAdapter.connect(device)
+		val bleConnection = bleAdapter.connect(device, config.autoConnect)
 		var deviceConnection: DeviceConnection? = null
 		var handedOff = false
 		try {

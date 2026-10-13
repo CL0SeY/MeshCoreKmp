@@ -24,6 +24,13 @@ class BlueFalconBleConnection internal constructor(
 	private val blueFalcon: BlueFalcon,
 	private val peripheral: BluetoothPeripheral,
 	override val deviceIdentifier: String,
+	/**
+	 * Opportunistic connect mode, forwarded to
+	 * `BlueFalcon.connect(peripheral, autoConnect = …)`. The attempt is still
+	 * bounded by [connectAndSetup]'s timeout and torn down on give-up, so it
+	 * cannot outlive the attempt. Default false: direct connects unchanged.
+	 */
+	private val autoConnect: Boolean = false,
 ) : BleConnection {
 
 	companion object {
@@ -211,7 +218,7 @@ class BlueFalconBleConnection internal constructor(
 				suspendCancellableCoroutine<Unit> { cont ->
 					connectContinuation = cont
 					setupPhase = SetupPhase.WAITING_CONNECT
-					blueFalcon.connect(peripheral, autoConnect = false)
+					blueFalcon.connect(peripheral, autoConnect = autoConnect)
 
 					cont.invokeOnCancellation {
 						connectContinuation = null

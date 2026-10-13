@@ -75,7 +75,10 @@ class BlueFalconBleAdapter(
 		blueFalcon.stopScanning()
 	}
 
-	override suspend fun connect(device: DiscoveredDevice): BleConnection {
+	override suspend fun connect(
+		device: DiscoveredDevice,
+		autoConnect: Boolean,
+	): BleConnection {
 		// Prefer a fresh peripheral from BlueFalcon's registry on reconnect —
 		// the cache may hold a stale GATT handle from before a deep-sleep wake
 		// that silently never fires onConnectionStateChange. Fall back to the
@@ -95,6 +98,7 @@ class BlueFalconBleAdapter(
 			peripheral = peripheral,
 			deviceIdentifier = device.identifier,
 			platformAppContext = platformAppContext,
+			autoConnect = autoConnect,
 		)
 	}
 

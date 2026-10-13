@@ -214,6 +214,32 @@ class DeviceScannerTest {
 		assertEquals(ConnectionState.Disconnected, bleConnection.connectionState.value)
 	}
 
+	@Test
+	fun connect_forwardsAutoConnectFromConfigToTheAdapter() = runTest {
+		val adapter = FakeBleAdapter()
+		val scanner = DeviceScanner(adapter)
+
+		// The fake answers no APP_START, so the handshake times out — the
+		// adapter was already handed the flag by then, which is the contract.
+		assertFailsWith<MeshCoreException.CommandTimeout> {
+			scanner.connect(sampleDevice, backgroundScope, handshakeOffConfig().copy(autoConnect = true))
+		}
+
+		assertEquals(true, adapter.lastConnectAutoConnect)
+	}
+
+	@Test
+	fun connect_defaultsToDirectConnect() = runTest {
+		val adapter = FakeBleAdapter()
+		val scanner = DeviceScanner(adapter)
+
+		assertFailsWith<MeshCoreException.CommandTimeout> {
+			scanner.connect(sampleDevice, backgroundScope, handshakeOffConfig())
+		}
+
+		assertEquals(false, adapter.lastConnectAutoConnect)
+	}
+
 	private fun handshakeOffConfig() = ConnectionConfig(
 		autoSyncTime = false,
 		autoFetchContacts = false,
@@ -244,5 +270,6 @@ private class LifecycleRecordingBleAdapter : BleAdapter {
 
 	override fun stopScan() = Unit
 
-	override suspend fun connect(device: DiscoveredDevice): BleConnection = error("scan-only fake")
+	override suspend fun connect(device: DiscoveredDevice, autoConnect: Boolean): BleConnection =
+		error("scan-only fake")
 }

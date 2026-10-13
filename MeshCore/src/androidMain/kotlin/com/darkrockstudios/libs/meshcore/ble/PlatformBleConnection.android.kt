@@ -9,6 +9,7 @@ internal actual suspend fun platformOpenBleConnection(
 	peripheral: BluetoothPeripheral,
 	deviceIdentifier: String,
 	platformAppContext: Any?,
+	autoConnect: Boolean,
 ): BleConnection {
 	val context =
 		(platformAppContext as? Context)?.applicationContext
@@ -20,5 +21,6 @@ internal actual suspend fun platformOpenBleConnection(
 		context = context,
 		device = peripheral.device,
 		deviceIdentifier = deviceIdentifier,
+		autoConnect = autoConnect,
 	)
 }
