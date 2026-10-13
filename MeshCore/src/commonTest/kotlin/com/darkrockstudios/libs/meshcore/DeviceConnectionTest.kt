@@ -628,24 +628,25 @@ class DeviceConnectionTest {
 		val baseWrites = bleConnection.writtenData.size
 
 		// A MessagesWaiting push whose GET_MESSAGE is never answered: the
-		// 10s command timeout must drop this drain, not the listener. (On a
-		// host scope this throw used to kill the process on the main thread.)
+		// bounded poll retry (DRAIN_POLL_MAX_ATTEMPTS attempts, 10s each)
+		// must drop this drain, not the listener. (On a host scope this
+		// throw used to kill the process on the main thread.)
 		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
 		testScheduler.advanceUntilIdle()
-		testScheduler.advanceTimeBy(11_000)
+		testScheduler.advanceTimeBy(10_000L * DRAIN_POLL_MAX_ATTEMPTS + 1_000)
 		testScheduler.runCurrent()
 
 		// A second push still triggers a fresh drain read: the listener
 		// survived the first timeout.
 		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
 		testScheduler.advanceUntilIdle()
-		testScheduler.advanceTimeBy(60_000)
+		testScheduler.advanceTimeBy(10_000L * DRAIN_POLL_MAX_ATTEMPTS * 2 + 1_000)
 		testScheduler.advanceUntilIdle()
 		val getMessageWrites =
 			bleConnection.writtenData
 				.drop(baseWrites)
 				.count { it.size == 1 && it[0] == 0x0A.toByte() }
-		assertEquals(2, getMessageWrites)
+		assertEquals(2 * DRAIN_POLL_MAX_ATTEMPTS, getMessageWrites)
 	}
 
 	@Test
@@ -787,11 +788,12 @@ class DeviceConnectionTest {
 		// a start with an explicit failure, never a silent start.
 		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
 		// Foreground spinner (see the test above): it also advances virtual
-		// time via delay(1) so the unanswered GET_MESSAGE's 10s timeout
-		// fires; the 30s cap bounds a regression into an assertion failure.
+		// time via delay(1) so each unanswered GET_MESSAGE's 10s timeout
+		// fires; the cap clears all bounded retries (3 x 10s) with margin
+		// and bounds a regression into an assertion failure.
 		var spinnerSpins = 0
 		val spinner = launch {
-			while (reports.size < 2 && spinnerSpins < 30_000) {
+			while (reports.size < 2 && spinnerSpins < 60_000) {
 				kotlinx.coroutines.delay(1)
 				spinnerSpins++
 			}
@@ -806,6 +808,177 @@ class DeviceConnectionTest {
 		assertEquals("push", failed.trigger)
 		assertEquals(0, failed.delivered)
 		assertTrue(failed.reason.contains("timed out"), "reason=${failed.reason}")
+		reportJob.cancel()
+	}
+
+	/** A 0x08 channel-message frame carrying [text] on channel 1. */
+	private fun createChannelMessageFrame(text: String): ByteArray {
+		val textBytes = text.encodeToByteArray()
+		val data = ByteArray(8 + textBytes.size)
+		data[0] = 0x08
+		data[1] = 0x01 // channel index
+		data[2] = 0x02 // path length
+		data[3] = 0x00 // text type (plain)
+		// Timestamp = 1000 (0x000003E8) in LE.
+		data[4] = 0xE8.toByte()
+		data[5] = 0x03
+		data[6] = 0x00
+		data[7] = 0x00
+		textBytes.copyInto(data, 8)
+		return data
+	}
+
+	@Test
+	fun drainReports_pushDrainRetriesSinglePollTimeout() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		val deliveredTexts = mutableListOf<String>()
+		val messageJob = launch { connection.incomingMessages.collect { deliveredTexts.add(it.text) } }
+		testScheduler.advanceUntilIdle()
+
+		// The first GET_MESSAGE is never answered — a transient BLE stall
+		// that burns one 10s timeout. The bounded retry re-polls, gets the
+		// waiting DM, and the next poll sees NoMoreMessages: the drain
+		// completes with the message delivered instead of failing empty.
+		// The responder keys answers off the GET_MESSAGE write count so the
+		// stalled first attempt stays unanswered.
+		var answeredPolls = 0
+		val drainResponder = launch {
+			var spins = 0
+			while (answeredPolls < 3 && spins < 100_000) {
+				val writes = bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+				while (answeredPolls < writes) {
+					answeredPolls++
+					when (answeredPolls) {
+						1 -> Unit // stall: no answer, let this attempt time out
+						2 -> bleConnection.simulateResponse(createChannelMessageFrame("Retry works"))
+						else -> bleConnection.simulateResponse(byteArrayOf(0x0A))
+					}
+				}
+				spins++
+				// delay, not yield: yield reschedules at the same virtual
+				// instant, so a yield-spin burns its whole budget before the
+				// stalled attempt's 10s timeout fires and nobody answers the
+				// retry. delay(1) paces the responder across virtual time.
+				kotlinx.coroutines.delay(1)
+			}
+		}
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		// Foreground spinner (see the tests above): it advances virtual time
+		// via delay(1) so the stalled first attempt's 10s timeout fires.
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 2 && spinnerSpins < 60_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+		drainResponder.cancel()
+
+		assertEquals(
+			listOf(
+				DrainReport.Started("push", 1),
+				DrainReport.Completed("push", 1),
+			),
+			reports,
+		)
+		assertEquals(listOf("Retry works"), deliveredTexts)
+		// Exactly three GET_MESSAGE polls: the stall, the message, NoMoreMessages.
+		assertEquals(3, answeredPolls)
+		reportJob.cancel()
+		messageJob.cancel()
+	}
+
+	@Test
+	fun drainReports_pushDrainFailsAfterBoundedPollAttempts() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		testScheduler.advanceUntilIdle()
+
+		// No answer to any GET_MESSAGE: every poll burns its 10s timeout, so
+		// the drain still fails — but only after exactly
+		// DRAIN_POLL_MAX_ATTEMPTS polls, never an unbounded loop.
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 2 && spinnerSpins < 120_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+
+		assertEquals(2, reports.size)
+		assertEquals(DrainReport.Started("push", 1), reports.first())
+		val failed = reports.last()
+		assertIs<DrainReport.Failed>(failed)
+		assertEquals("push", failed.trigger)
+		assertEquals(0, failed.delivered)
+		assertTrue(failed.reason.contains("timed out"), "reason=${failed.reason}")
+		val getMessageWrites =
+			bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+		assertEquals(DRAIN_POLL_MAX_ATTEMPTS, getMessageWrites)
 		reportJob.cancel()
 	}
 

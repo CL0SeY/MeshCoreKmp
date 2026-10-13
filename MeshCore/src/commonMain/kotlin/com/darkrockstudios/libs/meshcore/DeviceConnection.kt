@@ -33,6 +33,15 @@ private const val MAX_ACK_WAIT_MILLIS = 120_000L
  */
 private const val DEFAULT_CHANNEL_SLOTS = 8
 
+/**
+ * GET_MESSAGE attempts per message slot inside a drain: the first try plus
+ * two retries. The node pops its offline queue on hand-over with no
+ * mark-read/ack, so a single 10s timeout must not consume-and-lose a waiting
+ * message — but the attempts stay bounded so a truly dead link still fails
+ * the drain instead of stalling it. Internal so tests pin the exact count.
+ */
+internal const val DRAIN_POLL_MAX_ATTEMPTS = 3
+
 class DeviceConnection internal constructor(
 	private val bleConnection: BleConnection,
 	internal val commandQueue: CommandQueue,
@@ -359,12 +368,35 @@ class DeviceConnection internal constructor(
 		}
 	}
 
+	/**
+	 * One drain slot with bounded CommandTimeout resilience: a single 10s
+	 * GET_MESSAGE timeout inside a drain is retried up to
+	 * [DRAIN_POLL_MAX_ATTEMPTS] total attempts before the error escapes and
+	 * fails the drain. The node's offline queue pops on hand-over with no
+	 * mark-read/ack and a late reply after a timeout is dropped, so a
+	 * transient BLE stall must not consume-and-lose the waiting message.
+	 * Anything but a [MeshCoreException.CommandTimeout] — including
+	 * cancellation — escapes immediately; a null (NoMoreMessages) ends the
+	 * drain, so retries apply per slot, not per drain.
+	 */
+	private suspend fun pollNextMessageWithRetry(): ReceivedMessage? {
+		var attempt = 0
+		while (true) {
+			try {
+				return pollNextMessage()
+			} catch (error: MeshCoreException.CommandTimeout) {
+				attempt++
+				if (attempt >= DRAIN_POLL_MAX_ATTEMPTS) throw error
+			}
+		}
+	}
+
 	private suspend fun drainMessages(trigger: String, waiting: Int? = null) {
 		_drainReports.tryEmit(DrainReport.Started(trigger, waiting))
 		var delivered = 0
 		try {
 			while (true) {
-				val msg = pollNextMessage() ?: break
+				val msg = pollNextMessageWithRetry() ?: break
 				_incomingMessages.emit(msg)
 				delivered++
 			}
