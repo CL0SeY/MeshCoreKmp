@@ -2,16 +2,20 @@
 
 package com.darkrockstudios.libs.meshcore
 
+import com.darkrockstudios.libs.meshcore.model.DrainReport
 import com.darkrockstudios.libs.meshcore.model.ReceivedBinaryResponse
 import com.darkrockstudios.libs.meshcore.model.ReceivedRawData
 import com.darkrockstudios.libs.meshcore.protocol.CommandQueue
+import com.darkrockstudios.libs.meshcore.protocol.CommandSerializer
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
 
 class DeviceConnectionTest {
 
@@ -34,12 +38,12 @@ class DeviceConnectionTest {
 		return data
 	}
 
-	private fun createDeviceInfoResponse(): ByteArray {
+	private fun createDeviceInfoResponse(maxChannels: Int = 8): ByteArray {
 		val data = ByteArray(80)
 		data[0] = 0x0D
 		data[1] = 0x03 // firmware v3
 		data[2] = 0x04 // max contacts raw=4, actual=8
-		data[3] = 0x08 // max channels=8
+		data[3] = maxChannels.toByte() // what the firmware advertises as its slot count
 		data[4] = 0xD2.toByte(); data[5] = 0x04; data[6] = 0x00; data[7] = 0x00 // PIN=1234
 		"1.0.0".encodeToByteArray().copyInto(data, 8)
 		"TestRadio".encodeToByteArray().copyInto(data, 20)
@@ -47,11 +51,38 @@ class DeviceConnectionTest {
 		return data
 	}
 
-	private fun createChannelInfoResponse(index: Int, name: String): ByteArray {
-		val data = ByteArray(34)
-		data[0] = 0x12
-		data[1] = index.toByte()
-		name.encodeToByteArray().copyInto(data, 2, 0, minOf(name.length, 32))
+    private fun createChannelInfoResponse(
+        index: Int,
+        name: String,
+        secret: ByteArray = byteArrayOf(),
+    ): ByteArray {
+        val data = ByteArray(if (secret.isEmpty()) 34 else 50)
+        data[0] = 0x12
+        data[1] = index.toByte()
+        // Raw byte copy, the way the node stores the field: cutting by chars
+        // mangles any multi-byte name (9 chars / 12 bytes lost its panda).
+        val nameBytes = name.encodeToByteArray()
+        nameBytes.copyInto(data, 2, 0, minOf(nameBytes.size, 32))
+        if (secret.isNotEmpty()) secret.copyInto(data, 34)
+        return data
+    }
+
+    /** The node's answer to `GET_CHANNEL [slot]`: empty slots come back zeroed. */
+    private fun channelSlotResponse(slot: Int): ByteArray = when (slot) {
+        0 -> createChannelInfoResponse(0, "Public", ByteArray(16) { (it + 1).toByte() })
+        9 -> createChannelInfoResponse(9, "Private", ByteArray(16) { (it + 0x20).toByte() })
+        else -> createChannelInfoResponse(slot, "", ByteArray(16))
+    }
+
+	/** A 0x03 contact frame with a flood path and [lastmod] in the trailing field. */
+	private fun createContactResponse(name: String, lastmod: Long): ByteArray {
+		val data = ByteArray(148)
+		data[0] = 0x03 // PACKET_CONTACT
+		for (i in 1..32) data[i] = i.toByte()
+		data[33] = 0x01 // contact type
+		data[35] = 0xFF.toByte() // flood (signed) path
+		name.encodeToByteArray().copyInto(data, 100, 0, minOf(name.length, 31))
+		CommandSerializer.putUInt32LE(data, 144, lastmod)
 		return data
 	}
 
@@ -139,12 +170,108 @@ class DeviceConnectionTest {
 		// Test getChannel
 		launch {
 			while (bleConnection.writtenData.size < 3) { kotlinx.coroutines.yield() }
-			bleConnection.simulateResponse(createChannelInfoResponse(1, "General"))
+            bleConnection.simulateResponse(createChannelInfoResponse(1, "General", ByteArray(16) { it.toByte() }))
 		}
 
-		val channel = connection.getChannel(1)
-		assertEquals(1, channel.index)
-		assertEquals("General", channel.name)
+        val channel = connection.getChannel(1)
+        assertEquals(1, channel.index)
+        assertEquals("General", channel.name)
+        assertEquals("000102030405060708090a0b0c0d0e0f", channel.secret)
+    }
+
+	@Test
+	fun initialize_fetchesEveryAdvertisedSlot() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = true,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		// The node advertises 40 slots in DEVICE_QUERY byte 3 and answers
+		// GET_CHANNEL for every one of them — empty slots come back zeroed.
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse(maxChannels = 40))
+			for (slot in 0 until 40) {
+				while (bleConnection.writtenData.size < 3 + slot) { kotlinx.coroutines.yield() }
+				bleConnection.simulateResponse(channelSlotResponse(slot))
+			}
+		}
+
+		connection.initialize()
+
+		assertEquals(40, connection.channels.value.size)
+
+		val slotNine = connection.channels.value.firstOrNull { it.index == 9 }
+		assertNotNull(slotNine)
+		assertEquals("Private", slotNine.name)
+		assertEquals("202122232425262728292a2b2c2d2e2f", slotNine.secret)
+
+		// Every slot below the advertised capacity was actually requested, in
+		// order, including the 38 the node answers with a zeroed frame.
+		val channelRequests =
+			bleConnection.writtenData.filter { it[0] == 0x1F.toByte() }.map { it[1].toInt() }
+		assertEquals((0 until 40).toList(), channelRequests)
+		assertEquals(38, connection.channels.value.count { it.name.isBlank() })
+	}
+
+	@Test
+	fun initialize_keepsChannelAboveSlotSeven() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = true,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse(maxChannels = 40))
+			for (slot in 0 until 40) {
+				while (bleConnection.writtenData.size < 3 + slot) { kotlinx.coroutines.yield() }
+				bleConnection.simulateResponse(channelSlotResponse(slot))
+			}
+		}
+
+		connection.initialize()
+
+		// The channels the node holds are exactly slots 0 and 9: a fetch that
+		// stops at slot 7 loses every channel the user created above it.
+		val named = connection.channels.value.filterNot { it.name.isBlank() }
+		assertEquals(listOf(0, 9), named.map { it.index })
+		assertEquals(listOf("Public", "Private"), named.map { it.name })
+		assertEquals(40, connection.channels.value.size)
 	}
 
 	@Test
@@ -287,6 +414,53 @@ class DeviceConnectionTest {
 		assertEquals(0x19.toByte(), cmd[0]) // CMD_SEND_RAW_DATA
 		assertEquals(0x00.toByte(), cmd[1]) // empty path
 	}
+    @Test
+    fun sendChannelMessage_usesProvidedTimestampSeconds() = runTest {
+        val bleConnection = FakeBleConnection()
+        val queue = CommandQueue(
+            connection = bleConnection,
+            scope = backgroundScope,
+        )
+        testScheduler.advanceUntilIdle()
+        val config = ConnectionConfig(
+            autoSyncTime = false,
+            autoFetchContacts = false,
+            autoFetchChannels = false,
+            autoPollMessages = false,
+        )
+        val connection = DeviceConnection(
+            bleConnection = bleConnection,
+            commandQueue = queue,
+            scope = backgroundScope,
+            config = config,
+        )
+
+        launch {
+            while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+            bleConnection.simulateResponse(createSelfInfoResponse())
+            kotlinx.coroutines.yield()
+            while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+            bleConnection.simulateResponse(createDeviceInfoResponse())
+        }
+        connection.initialize()
+
+        launch {
+            while (bleConnection.writtenData.size < 3) { kotlinx.coroutines.yield() }
+            bleConnection.simulateResponse(byteArrayOf(0x00))
+        }
+
+        connection.sendChannelMessage(
+            channelIndex = 2,
+            text = "Hi",
+            timestampSeconds = 0x78563412L,
+        )
+
+        val command = bleConnection.writtenData[2]
+        assertContentEquals(
+            byteArrayOf(0x03, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78),
+            command.copyOfRange(0, 7),
+        )
+    }
 
 	@Test
 	fun sendBinaryRequest_sendsAndReceivesConfirmation() = runTest {
@@ -327,14 +501,14 @@ class DeviceConnectionTest {
 			resp[0] = 0x06
 			resp[1] = 0x01 // message type
 			resp[2] = 0x39; resp[3] = 0x30; resp[4] = 0x00; resp[5] = 0x00 // expected ack
-			resp[6] = 0x1E; resp[7] = 0x00; resp[8] = 0x00; resp[9] = 0x00 // timeout = 30s
+			resp[6] = 0x1E; resp[7] = 0x00; resp[8] = 0x00; resp[9] = 0x00 // timeout = 30 ms
 			bleConnection.simulateResponse(resp)
 		}
 
 		val publicKey = ByteArray(32) { it.toByte() }
 		val confirmation = connection.sendBinaryRequest(publicKey, byteArrayOf(0xFF.toByte()))
 		assertEquals(1, confirmation.messageType)
-		assertEquals(30, confirmation.suggestedTimeoutSeconds)
+		assertEquals(30, confirmation.suggestedTimeoutMillis)
 
 		// Verify the command was sent with correct format
 		val cmd = bleConnection.writtenData[2]
@@ -418,5 +592,521 @@ class DeviceConnectionTest {
 		assertContentEquals(byteArrayOf(0xDE.toByte(), 0xAD.toByte()), collected[0].responseData)
 
 		collectJob.cancel()
+	}
+
+	@Test
+	fun messagesWaitingDrainTimeoutKeepsListenerAlive() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		val initJob = launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		initJob.cancel()
+		testScheduler.advanceUntilIdle()
+		val baseWrites = bleConnection.writtenData.size
+
+		// A MessagesWaiting push whose GET_MESSAGE is never answered: the
+		// bounded poll retry (DRAIN_POLL_MAX_ATTEMPTS attempts, 10s each)
+		// must drop this drain, not the listener. (On a host scope this
+		// throw used to kill the process on the main thread.)
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		testScheduler.advanceUntilIdle()
+		testScheduler.advanceTimeBy(10_000L * DRAIN_POLL_MAX_ATTEMPTS + 1_000)
+		testScheduler.runCurrent()
+
+		// A second push still triggers a fresh drain read: the listener
+		// survived the first timeout.
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		testScheduler.advanceUntilIdle()
+		testScheduler.advanceTimeBy(10_000L * DRAIN_POLL_MAX_ATTEMPTS * 2 + 1_000)
+		testScheduler.advanceUntilIdle()
+		val getMessageWrites =
+			bleConnection.writtenData
+				.drop(baseWrites)
+				.count { it.size == 1 && it[0] == 0x0A.toByte() }
+		assertEquals(2 * DRAIN_POLL_MAX_ATTEMPTS, getMessageWrites)
+	}
+
+	@Test
+	fun messagesWaiting_flowObservesPushWithoutFetching() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val observed = mutableListOf<Int>()
+		val collectJob = launch { connection.messagesWaiting.collect { observed.add(it.count) } }
+		testScheduler.advanceUntilIdle()
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		testScheduler.advanceUntilIdle()
+
+		// Two pushes with different counts: the flow observes both, and the
+		// observation itself issues no GET_MESSAGE — the auto-drain owns the
+		// fetches. The responder answers by sticky write-count: each new
+		// 0x0A byte in the log earns one 0x0A reply, for exactly two fetches
+		// (one per push).
+		var servedFetches = 0
+		val drainResponder = launch {
+			var answered = 0
+			var spins = 0
+			while (answered < 2 && spins < 10_000) {
+				val writes = bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+				while (answered < writes) {
+					answered++
+					servedFetches++
+					bleConnection.simulateResponse(byteArrayOf(0x0A))
+				}
+				spins++
+				kotlinx.coroutines.yield()
+			}
+		}
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x02))
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		// Foreground spinner: the drains run in backgroundScope, and
+		// advanceUntilIdle stops as soon as only background events remain
+		// (its stop condition is "no foreground events"), which starved every
+		// earlier version of this test exactly while the drain was resuming.
+		// The spinner (launched from this foreground test body) re-queues a
+		// foreground delay(1) event until both drains report, keeping the
+		// pump alive; the spin cap turns a regression into an assertion
+		// failure instead of a hang.
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 4 && spinnerSpins < 10_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+		drainResponder.cancel()
+		collectJob.cancel()
+
+		assertEquals(listOf(2, 1), observed)
+		// No collector of messagesWaiting may fetch: the two GET_MESSAGE
+		// writes came from the library's own auto-drain — one per push.
+		assertEquals(2, servedFetches)
+		// Each push brackets its own drain: Started carries the node's push
+		// count, then exactly one terminal report. The NoMoreMessages
+		// answers mean zero delivered, and neither collector fetched.
+		assertEquals(
+			listOf(
+				DrainReport.Started("push", 2),
+				DrainReport.Completed("push", 0),
+				DrainReport.Started("push", 1),
+				DrainReport.Completed("push", 0),
+			),
+			reports,
+		)
+		reportJob.cancel()
+	}
+
+	@Test
+	fun drainReports_failedPushDrainNamesReason() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		testScheduler.advanceUntilIdle()
+
+		// No answer to the drain's GET_MESSAGE: the 10s command timeout must
+		// surface as Failed with the reason and the delivered count so far —
+		// a start with an explicit failure, never a silent start.
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		// Foreground spinner (see the test above): it also advances virtual
+		// time via delay(1) so each unanswered GET_MESSAGE's 10s timeout
+		// fires; the cap clears all bounded retries (3 x 10s) with margin
+		// and bounds a regression into an assertion failure.
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 2 && spinnerSpins < 60_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+
+		assertEquals(2, reports.size)
+		assertEquals(DrainReport.Started("push", 1), reports.first())
+		val failed = reports.last()
+		assertIs<DrainReport.Failed>(failed)
+		assertEquals("push", failed.trigger)
+		assertEquals(0, failed.delivered)
+		assertTrue(failed.reason.contains("timed out"), "reason=${failed.reason}")
+		reportJob.cancel()
+	}
+
+	/** A 0x08 channel-message frame carrying [text] on channel 1. */
+	private fun createChannelMessageFrame(text: String): ByteArray {
+		val textBytes = text.encodeToByteArray()
+		val data = ByteArray(8 + textBytes.size)
+		data[0] = 0x08
+		data[1] = 0x01 // channel index
+		data[2] = 0x02 // path length
+		data[3] = 0x00 // text type (plain)
+		// Timestamp = 1000 (0x000003E8) in LE.
+		data[4] = 0xE8.toByte()
+		data[5] = 0x03
+		data[6] = 0x00
+		data[7] = 0x00
+		textBytes.copyInto(data, 8)
+		return data
+	}
+
+	@Test
+	fun drainReports_pushDrainRetriesSinglePollTimeout() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		val deliveredTexts = mutableListOf<String>()
+		val messageJob = launch { connection.incomingMessages.collect { deliveredTexts.add(it.text) } }
+		testScheduler.advanceUntilIdle()
+
+		// The first GET_MESSAGE is never answered — a transient BLE stall
+		// that burns one 10s timeout. The bounded retry re-polls, gets the
+		// waiting DM, and the next poll sees NoMoreMessages: the drain
+		// completes with the message delivered instead of failing empty.
+		// The responder keys answers off the GET_MESSAGE write count so the
+		// stalled first attempt stays unanswered.
+		var answeredPolls = 0
+		val drainResponder = launch {
+			var spins = 0
+			while (answeredPolls < 3 && spins < 100_000) {
+				val writes = bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+				while (answeredPolls < writes) {
+					answeredPolls++
+					when (answeredPolls) {
+						1 -> Unit // stall: no answer, let this attempt time out
+						2 -> bleConnection.simulateResponse(createChannelMessageFrame("Retry works"))
+						else -> bleConnection.simulateResponse(byteArrayOf(0x0A))
+					}
+				}
+				spins++
+				// delay, not yield: yield reschedules at the same virtual
+				// instant, so a yield-spin burns its whole budget before the
+				// stalled attempt's 10s timeout fires and nobody answers the
+				// retry. delay(1) paces the responder across virtual time.
+				kotlinx.coroutines.delay(1)
+			}
+		}
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		// Foreground spinner (see the tests above): it advances virtual time
+		// via delay(1) so the stalled first attempt's 10s timeout fires.
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 2 && spinnerSpins < 60_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+		drainResponder.cancel()
+
+		assertEquals(
+			listOf(
+				DrainReport.Started("push", 1),
+				DrainReport.Completed("push", 1),
+			),
+			reports,
+		)
+		assertEquals(listOf("Retry works"), deliveredTexts)
+		// Exactly three GET_MESSAGE polls: the stall, the message, NoMoreMessages.
+		assertEquals(3, answeredPolls)
+		reportJob.cancel()
+		messageJob.cancel()
+	}
+
+	@Test
+	fun drainReports_pushDrainFailsAfterBoundedPollAttempts() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		val reports = mutableListOf<DrainReport>()
+		val reportJob = launch { connection.drainReports.collect { reports.add(it) } }
+		testScheduler.advanceUntilIdle()
+
+		// No answer to any GET_MESSAGE: every poll burns its 10s timeout, so
+		// the drain still fails — but only after exactly
+		// DRAIN_POLL_MAX_ATTEMPTS polls, never an unbounded loop.
+		bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01))
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (reports.size < 2 && spinnerSpins < 120_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+
+		assertEquals(2, reports.size)
+		assertEquals(DrainReport.Started("push", 1), reports.first())
+		val failed = reports.last()
+		assertIs<DrainReport.Failed>(failed)
+		assertEquals("push", failed.trigger)
+		assertEquals(0, failed.delivered)
+		assertTrue(failed.reason.contains("timed out"), "reason=${failed.reason}")
+		val getMessageWrites =
+			bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+		assertEquals(DRAIN_POLL_MAX_ATTEMPTS, getMessageWrites)
+		reportJob.cancel()
+	}
+
+	@Test
+	fun drainReports_neverStallTheDrain() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+		testScheduler.advanceUntilIdle()
+
+		// A consumer that takes one report and then stops consuming forever
+		// (awaitCancellation schedules no timer, so it cannot keep the
+		// scheduler alive). With a suspending emit, the tenth report would
+		// back up behind the 8-slot buffer and park the push listener
+		// mid-drain; tryEmit drops instead, so every drain still finishes.
+		val stalledConsumer = launch {
+			connection.drainReports.collect { kotlinx.coroutines.awaitCancellation() }
+		}
+		testScheduler.advanceUntilIdle()
+
+		val pushes = 10
+		var servedFetches = 0
+		val drainResponder = launch {
+			var answered = 0
+			var spins = 0
+			while (answered < pushes && spins < 20_000) {
+				val writes = bleConnection.writtenData.count { it.size == 1 && it[0] == 0x0A.toByte() }
+				while (answered < writes) {
+					answered++
+					servedFetches++
+					bleConnection.simulateResponse(byteArrayOf(0x0A))
+				}
+				spins++
+				kotlinx.coroutines.yield()
+			}
+		}
+		repeat(pushes) { bleConnection.simulateResponse(byteArrayOf(0x83.toByte(), 0x01)) }
+		var spinnerSpins = 0
+		val spinner = launch {
+			while (servedFetches < pushes && spinnerSpins < 30_000) {
+				kotlinx.coroutines.delay(1)
+				spinnerSpins++
+			}
+		}
+		testScheduler.advanceUntilIdle()
+		spinner.cancel()
+		drainResponder.cancel()
+		stalledConsumer.cancel()
+
+		assertEquals(pushes, servedFetches)
+	}
+
+	@Test
+	fun getContactsSince_returnsStreamedDeltaWithStreamCursor() = runTest {
+		val bleConnection = FakeBleConnection()
+		val queue = CommandQueue(
+			connection = bleConnection,
+			scope = backgroundScope,
+		)
+		testScheduler.advanceUntilIdle()
+		val config = ConnectionConfig(
+			autoSyncTime = false,
+			autoFetchContacts = false,
+			autoFetchChannels = false,
+			autoPollMessages = false,
+		)
+		val connection = DeviceConnection(
+			bleConnection = bleConnection,
+			commandQueue = queue,
+			scope = backgroundScope,
+			config = config,
+		)
+
+		launch {
+			while (bleConnection.writtenData.isEmpty()) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createSelfInfoResponse())
+			kotlinx.coroutines.yield()
+			while (bleConnection.writtenData.size < 2) { kotlinx.coroutines.yield() }
+			bleConnection.simulateResponse(createDeviceInfoResponse())
+		}
+		connection.initialize()
+
+		launch {
+			while (bleConnection.writtenData.size < 3) { kotlinx.coroutines.yield() }
+			// START reports the unfiltered count (7), one filtered contact
+			// follows, END reports that contact's lastmod (1000) as the cursor.
+			bleConnection.simulateResponse(byteArrayOf(0x02, 0x07, 0x00, 0x00, 0x00))
+			bleConnection.simulateResponse(createContactResponse("Delta Node", 1000L))
+			bleConnection.simulateResponse(byteArrayOf(0x04, 0xE8.toByte(), 0x03, 0x00, 0x00))
+		}
+
+		val fetch = connection.getContactsSince(42)
+
+		// The request carried the filter: 42 as 4-byte LE after CMD_GET_CONTACTS (0x04).
+		assertContentEquals(
+			byteArrayOf(0x04, 0x2A, 0x00, 0x00, 0x00),
+			bleConnection.writtenData[2],
+		)
+		assertEquals(1, fetch.contacts.size)
+		assertEquals("Delta Node", fetch.contacts[0].name)
+		assertEquals(1000L, fetch.contacts[0].lastmod)
+		assertEquals(7, fetch.totalAtStart)
+		assertEquals(1000L, fetch.mostRecentLastmod)
+		// A delta is not the full list, so it must not be published.
+		assertEquals(0, connection.contacts.value.size)
 	}
 }

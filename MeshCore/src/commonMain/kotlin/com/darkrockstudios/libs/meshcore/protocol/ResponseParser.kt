@@ -2,6 +2,14 @@ package com.darkrockstudios.libs.meshcore.protocol
 
 object ResponseParser {
 
+	/**
+	 * Wire size of a `PUSH_CODE_PATH_UPDATED` frame: the code byte plus the
+	 * 32-byte contact public key. The firmware sends no path bytes
+	 * (`MyMesh.cpp` `onContactPathUpdated`), so any other length is not a
+	 * path update.
+	 */
+	private const val PATH_UPDATED_FRAME_SIZE = 33
+
 	fun parse(data: ByteArray): Response? {
 		if (data.isEmpty()) return null
 		val code = data[0].toInt() and 0xFF
@@ -13,9 +21,9 @@ object ResponseParser {
 			ResponseCode.PACKET_SELF_INFO -> parseSelfInfo(data)
 			ResponseCode.PACKET_BATTERY -> parseBattery(data)
 			ResponseCode.PACKET_CHANNEL_INFO -> parseChannelInfo(data)
-			ResponseCode.PACKET_CONTACT_START -> Response.ContactStart
+			ResponseCode.PACKET_CONTACT_START -> parseContactStart(data)
 			ResponseCode.PACKET_CONTACT -> parseContact(data)
-			ResponseCode.PACKET_CONTACT_END -> Response.ContactEnd
+			ResponseCode.PACKET_CONTACT_END -> parseContactEnd(data)
 			ResponseCode.PACKET_MSG_SENT -> parseMessageSent(data)
 			ResponseCode.PACKET_CHANNEL_MSG_RECV -> parseChannelMessage(data, v3 = false)
 			ResponseCode.PACKET_CHANNEL_MSG_RECV_V3 -> parseChannelMessage(data, v3 = true)
@@ -56,6 +64,7 @@ object ResponseParser {
 					data.size
 				)
 			)
+			ResponseCode.PUSH_CODE_PATH_UPDATED -> parsePathUpdated(data)
 
 			ResponseCode.PUSH_CODE_CONTROL_DATA -> parseControlData(data)
 			ResponseCode.PUSH_CODE_CONTACT_DELETED -> parseContactDeleted(data)
@@ -174,7 +183,8 @@ object ResponseParser {
 		if (data.size < 2) return null
 		val index = data[1].toInt() and 0xFF
 		val name = if (data.size >= 34) extractString(data, 2, 32) else ""
-		return Response.ChannelInfo(index = index, name = name)
+		val secret = if (data.size >= 50) data.copyOfRange(34, 50).toHexString() else ""
+		return Response.ChannelInfo(index = index, name = name, secret = secret)
 	}
 
 	private fun parseContact(data: ByteArray): Response.Contact? {
@@ -184,8 +194,23 @@ object ResponseParser {
 		val publicKey = data.copyOfRange(1, 33)
 		val contactType = data[33].toInt() and 0xFF
 		val flags = data[34].toInt() and 0xFF
-		val outPathLen = data[35].toInt() // signed
-		// bytes 36-99: out_path (64 bytes) — skipped
+		// Path-length byte: 255 (0xFF) = flood/signed contact; otherwise the
+		// low 6 bits are the path length and the high 2 the hash mode.
+		val pathLenByte = data[35].toUByte().toInt()
+		val isFloodPath = pathLenByte == 255
+		val outPathHashMode = if (isFloodPath) -1 else pathLenByte shr 6
+		val outPathLen = if (isFloodPath) -1 else pathLenByte and 0x3F
+		// bytes 36-99: out_path (64 bytes, fixed field, NUL-padded past the
+		// real path). Keep the occupied bytes so a contact write-back echoes
+		// the routing path instead of zeroing it.
+		val pathUsed =
+			if (outPathLen > 0) {
+				minOf(outPathLen * (outPathHashMode + 1), 64)
+			} else {
+				0
+			}
+		val outPath =
+			if (pathUsed > 0) data.copyOfRange(36, 36 + pathUsed) else ByteArray(0)
 		val name = extractString(data, 100, 32)
 
 		val lastAdvertTimestamp = if (data.size >= 136) getUInt32LE(data, 132) else 0L
@@ -200,12 +225,26 @@ object ResponseParser {
 			type = contactType,
 			flags = flags,
 			outPathLen = outPathLen,
+			outPath = outPath,
+			outPathHashMode = outPathHashMode,
 			name = name,
 			lastAdvertTimestamp = lastAdvertTimestamp,
 			gpsLatitude = gpsLat,
 			gpsLongitude = gpsLon,
 			lastmod = lastmod,
 		)
+	}
+
+	// MyMesh.cpp:1338-1341 / :2361-2365 always write the 4-byte payload; the 0
+	// default is only a malformed-frame guard that must not throw mid-stream.
+	private fun parseContactStart(data: ByteArray): Response.ContactStart {
+		val total = if (data.size >= 5) getUInt32LE(data, 1).toInt() else 0
+		return Response.ContactStart(total)
+	}
+
+	private fun parseContactEnd(data: ByteArray): Response.ContactEnd {
+		val mostRecentLastmod = if (data.size >= 5) getUInt32LE(data, 1) else 0L
+		return Response.ContactEnd(mostRecentLastmod)
 	}
 
 	private fun parseMessageSent(data: ByteArray): Response.MessageSent? {
@@ -217,7 +256,7 @@ object ResponseParser {
 		return Response.MessageSent(
 			messageType = msgType,
 			expectedAck = expectedAck,
-			suggestedTimeoutSeconds = suggestedTimeout,
+			suggestedTimeoutMillis = suggestedTimeout,
 		)
 	}
 
@@ -424,10 +463,26 @@ object ResponseParser {
 	}
 
 	private fun parseTelemetryResponse(data: ByteArray): Response.TelemetryResponse {
-		val prefix = if (data.size >= 7) data.copyOfRange(1, 7).toHexString() else ""
-		val telemetryData = if (data.size > 7) data.copyOfRange(7, data.size) else ByteArray(0)
+		// Wire frame (firmware MyMesh.cpp, meshcore.js, meshcore_py):
+		// [0x8B][reserved 0x00][6-byte public-key prefix][CayenneLPP payload]
+		val prefix = if (data.size >= 8) data.copyOfRange(2, 8).toHexString() else ""
+		val telemetryData = if (data.size > 8) data.copyOfRange(8, data.size) else ByteArray(0)
 		return Response.TelemetryResponse(prefix, telemetryData)
 	}
+
+	/**
+	 * `PUSH_CODE_PATH_UPDATED`: exactly `[0x81][32-byte public key]`. Only that
+	 * exact frame is a path update; a shorter or longer one falls through to
+	 * [Response.Unhandled] with the same code point and payload the generic
+	 * branch would have produced, so a malformed frame never becomes a partial
+	 * or zero-padded typed event.
+	 */
+	private fun parsePathUpdated(data: ByteArray): Response =
+		if (data.size == PATH_UPDATED_FRAME_SIZE) {
+			Response.PathUpdated(data.copyOfRange(1, PATH_UPDATED_FRAME_SIZE))
+		} else {
+			Response.Unhandled(ResponseCode.PUSH_CODE_PATH_UPDATED, data.copyOfRange(1, data.size))
+		}
 
 	private fun parseControlData(data: ByteArray): Response.ControlData {
 		val type = if (data.size >= 2) data[1].toInt() and 0xFF else 0

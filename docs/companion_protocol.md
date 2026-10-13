@@ -682,7 +682,7 @@ def parse_self_info(data):
 Byte 0: 0x06
 Byte 1: Message Type
 Bytes 2-5: Expected ACK (4 bytes, hex)
-Bytes 6-9: Suggested Timeout (32-bit little-endian, seconds)
+Bytes 6-9: Suggested Timeout (32-bit little-endian, milliseconds)
 ```
 
 **PACKET_ACK** (0x82):

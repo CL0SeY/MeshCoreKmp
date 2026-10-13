@@ -44,15 +44,24 @@ sealed class Response {
 	data class ChannelInfo(
 		val index: Int,
 		val name: String,
+		val secret: String = "",
 	) : Response()
 
-	data object ContactStart : Response()
+	/**
+	 * `RESP_CODE_CONTACTS_START` (0x02): the head of a contact stream. The
+	 * firmware writes `[0x02][count as 4-byte LE]` (MyMesh.cpp:1338-1341),
+	 * where [total] is the node's unfiltered `getNumContacts()` — not the
+	 * number of records that follow, which a `since` filter can shrink.
+	 */
+	data class ContactStart(val total: Int) : Response()
 
 	data class Contact(
 		val publicKey: ByteArray,
 		val type: Int,
 		val flags: Int,
 		val outPathLen: Int,
+		val outPath: ByteArray = ByteArray(0),
+		val outPathHashMode: Int = 0,
 		val name: String,
 		val lastAdvertTimestamp: Long,
 		val gpsLatitude: Double?,
@@ -68,11 +77,13 @@ sealed class Response {
 			if (type != other.type) return false
 			if (flags != other.flags) return false
 			if (outPathLen != other.outPathLen) return false
+			if (outPathHashMode != other.outPathHashMode) return false
 			if (lastAdvertTimestamp != other.lastAdvertTimestamp) return false
 			if (gpsLatitude != other.gpsLatitude) return false
 			if (gpsLongitude != other.gpsLongitude) return false
 			if (lastmod != other.lastmod) return false
 			if (!publicKey.contentEquals(other.publicKey)) return false
+			if (!outPath.contentEquals(other.outPath)) return false
 			if (name != other.name) return false
 
 			return true
@@ -82,22 +93,34 @@ sealed class Response {
 			var result = type
 			result = 31 * result + flags
 			result = 31 * result + outPathLen
+			result = 31 * result + outPathHashMode
 			result = 31 * result + lastAdvertTimestamp.hashCode()
 			result = 31 * result + (gpsLatitude?.hashCode() ?: 0)
 			result = 31 * result + (gpsLongitude?.hashCode() ?: 0)
 			result = 31 * result + lastmod.hashCode()
 			result = 31 * result + publicKey.contentHashCode()
+			result = 31 * result + outPath.contentHashCode()
 			result = 31 * result + name.hashCode()
 			return result
 		}
 	}
 
-	data object ContactEnd : Response()
+	/**
+	 * `RESP_CODE_END_OF_CONTACTS` (0x04): the tail of a contact stream, wire
+	 * shape `[0x04][lastmod as 4-byte LE]` (MyMesh.cpp:2361-2365).
+	 *
+	 * [mostRecentLastmod] is the max `lastmod` among the records actually
+	 * streamed in this reply, and 0 when none were streamed. Callers must not
+	 * overwrite a live `since` cursor with it: an empty reply leaves a full
+	 * cursor standing, so a caller that adopts the 0 would re-fetch every
+	 * contact on the next refresh.
+	 */
+	data class ContactEnd(val mostRecentLastmod: Long) : Response()
 
 	data class MessageSent(
 		val messageType: Int,
 		val expectedAck: String,
-		val suggestedTimeoutSeconds: Int,
+		val suggestedTimeoutMillis: Int,
 	) : Response()
 
 	data class ChannelMessageReceived(
@@ -312,6 +335,24 @@ sealed class Response {
 		}
 
 		override fun hashCode(): Int = rawData.contentHashCode()
+	}
+
+	/**
+	 * `PUSH_CODE_PATH_UPDATED` (0x81): the node changed a contact's stored out
+	 * path. The wire frame is exactly `[0x81][32-byte contact public key]` and
+	 * carries no path bytes (firmware `MyMesh.cpp` `onContactPathUpdated`), so
+	 * the key is all this event can report. Content-based equality, matching
+	 * the other byte-array responses: a plain data class would compare the
+	 * array by reference and two identical frames would not be equal.
+	 */
+	data class PathUpdated(val publicKey: ByteArray) : Response() {
+		override fun equals(other: Any?): Boolean {
+			if (this === other) return true
+			if (other !is PathUpdated) return false
+			return publicKey.contentEquals(other.publicKey)
+		}
+
+		override fun hashCode(): Int = publicKey.contentHashCode()
 	}
 
 	data class ControlData(val type: Int, val payload: ByteArray) : Response() {

@@ -5,11 +5,42 @@ import com.darkrockstudios.libs.meshcore.ble.ConnectionState
 import com.darkrockstudios.libs.meshcore.model.*
 import com.darkrockstudios.libs.meshcore.protocol.CommandQueue
 import com.darkrockstudios.libs.meshcore.protocol.CommandSerializer
+import com.darkrockstudios.libs.meshcore.protocol.MAX_GROUP_CHANNELS
 import com.darkrockstudios.libs.meshcore.protocol.Response
+import io.github.aakira.napier.Napier
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel as CoroutineChannel
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
+
+/**
+ * Upper bound on a single ACK wait. The node's estimate arrives as a raw
+ * uint32 in milliseconds, so a garbled frame must not hold the caller — and
+ * the BLE command gate the caller sits behind — for hours. Even a multi-hop
+ * flood on the slowest spreading factor estimates well under two minutes.
+ */
+private const val MAX_ACK_WAIT_MILLIS = 120_000L
+
+/**
+ * Slots to fetch when no DEVICE_QUERY answer has landed yet: the eight the
+ * channel fetch asked for before the advertised capacity was honoured, so an
+ * unqueried node is asked for neither more nor fewer.
+ */
+private const val DEFAULT_CHANNEL_SLOTS = 8
+
+/**
+ * GET_MESSAGE attempts per message slot inside a drain: the first try plus
+ * two retries. The node pops its offline queue on hand-over with no
+ * mark-read/ack, so a single 10s timeout must not consume-and-lose a waiting
+ * message — but the attempts stay bounded so a truly dead link still fails
+ * the drain instead of stalling it. Internal so tests pin the exact count.
+ */
+internal const val DRAIN_POLL_MAX_ATTEMPTS = 3
 
 class DeviceConnection internal constructor(
 	private val bleConnection: BleConnection,
@@ -34,6 +65,12 @@ class DeviceConnection internal constructor(
 
 	private val _incomingMessages = MutableSharedFlow<ReceivedMessage>(extraBufferCapacity = 64)
 	val incomingMessages: Flow<ReceivedMessage> = _incomingMessages.asSharedFlow()
+
+	private val _drainReports =
+		MutableSharedFlow<DrainReport>(
+			extraBufferCapacity = 8,
+			onBufferOverflow = BufferOverflow.DROP_OLDEST,
+		)
 
 	val acks: Flow<String> = commandQueue.pushEvents
 		.filterIsInstance<Response.Ack>()
@@ -67,11 +104,18 @@ class DeviceConnection internal constructor(
 	val traceData: Flow<Response.TraceData> = commandQueue.pushEvents
 		.filterIsInstance<Response.TraceData>()
 
+	val logData: Flow<Response.LogData> = commandQueue.pushEvents
+		.filterIsInstance<Response.LogData>()
+
 	val newAdverts: Flow<Response.NewAdvert> = commandQueue.pushEvents
 		.filterIsInstance<Response.NewAdvert>()
 
 	val telemetryResponses: Flow<Response.TelemetryResponse> = commandQueue.pushEvents
 		.filterIsInstance<Response.TelemetryResponse>()
+
+	/** `PUSH_CODE_PATH_UPDATED` pushes: the node changed a contact's out path. */
+	val pathUpdated: Flow<Response.PathUpdated> = commandQueue.pushEvents
+		.filterIsInstance<Response.PathUpdated>()
 
 	val pathDiscoveryResponses: Flow<Response.PathDiscoveryResponse> = commandQueue.pushEvents
 		.filterIsInstance<Response.PathDiscoveryResponse>()
@@ -82,6 +126,37 @@ class DeviceConnection internal constructor(
 	val contactDeleted: Flow<String> = commandQueue.pushEvents
 		.filterIsInstance<Response.ContactDeleted>()
 		.map { it.publicKeyPrefix }
+
+	/**
+	 * `PUSH_CODE_MSG_WAITING` (0x83) pushes: the node's offline queue holds
+	 * [Response.MessagesWaiting.count] messages for this client.
+	 * Observation-only: the auto-drain inside [initialize] performs the same
+	 * [pollNextMessage] loop, so collectors of this flow MUST NOT fetch.
+	 * A push means "drain now", nothing more: pushes arriving while a drain
+	 * runs queue behind it (pushEvents buffers 64) and each still triggers
+	 * its own drain in turn, so every push surfaces as a separate emission.
+	 * Consumers should nonetheless key on the count rather than arrival
+	 * order (e.g. only treat a larger count than the last observed one as
+	 * new), and treat any emission as a drain trigger.
+	 */
+	val messagesWaiting: Flow<Response.MessagesWaiting> = commandQueue.pushEvents
+		.filterIsInstance<Response.MessagesWaiting>()
+
+	/**
+	 * Lifecycle of the library's own drains: one [DrainReport.Started] before
+	 * the first fetch, then exactly one [DrainReport.Completed] or
+	 * [DrainReport.Failed] per drain — unless the drain is cancelled, in
+	 * which case the [DrainReport.Started] has no terminal (a cancel is
+	 * start-with-no-terminal, the interrupted-drain signature, never a
+	 * [DrainReport.Failed]). The host's wake log brackets its own
+	 * connect-path drain; this flow brackets the push drain, so a missing
+	 * message reads as start-with-no-done (or an explicit failure) instead of
+	 * silence. Observation-only: reports never fetch, and reporting never
+	 * stalls a drain — emissions use tryEmit with a small buffer (8), so a
+	 * stalled consumer loses the oldest unread report instead of parking the
+	 * push listener, and with no consumer at all reports are discarded.
+	 */
+	val drainReports: Flow<DrainReport> = _drainReports.asSharedFlow()
 
 	internal suspend fun initialize() {
 		// 1. APP_START — returns SelfInfo
@@ -104,8 +179,12 @@ class DeviceConnection internal constructor(
 		}
 
 		if (config.autoFetchChannels) {
-			val maxChannels = deviceInfoResp.maxChannels.coerceIn(1, 8)
+			val maxChannels = advertisedChannelSlotCount()
 			val channelList = mutableListOf<Channel>()
+			// Ask for every slot below the advertised capacity, empty ones
+			// included: slots are written and cleared independently, so the
+			// channels in use can sit anywhere and a hole must not stop the
+			// fetch short of the slots above it.
 			for (i in 0 until maxChannels) {
 				val ch = getChannel(i)
 				channelList.add(ch)
@@ -114,14 +193,26 @@ class DeviceConnection internal constructor(
 		}
 
 		if (config.autoPollMessages) {
-			drainMessages()
+			drainMessages(trigger = "init")
 		}
 
 		// Setup message waiting listener
 		scope.launch {
 			commandQueue.pushEvents
 				.filterIsInstance<Response.MessagesWaiting>()
-				.collect { drainMessages() }
+				.collect { waiting ->
+					// A stalled GET_MESSAGE (10s command timeout) must drop
+					// this drain, never the scope: the scope belongs to the
+					// host app (main thread on Android), where an uncaught
+					// throw kills the process and eats later pushes.
+					try {
+						drainMessages(trigger = "push", waiting = waiting.count)
+					} catch (cancelled: CancellationException) {
+						throw cancelled
+					} catch (error: Exception) {
+						Napier.w(tag = TAG) { "message drain failed: ${error.message}" }
+					}
+				}
 		}
 	}
 
@@ -146,16 +237,29 @@ class DeviceConnection internal constructor(
 
 	// --- Channels ---
 
+	/**
+	 * Slot count to fetch: the capacity DEVICE_QUERY advertised, capped at
+	 * [MAX_GROUP_CHANNELS]. A reported 0 — a legacy or short frame carrying no
+	 * capacity — keeps the single-slot behaviour, and a real capacity is never
+	 * exceeded: a slot at or above it answers ERR, which would fail the
+	 * connect. Before any DEVICE_QUERY answer (null device info) fall back to
+	 * [DEFAULT_CHANNEL_SLOTS] rather than one slot: slots are written
+	 * independently, so under-asking loses channels while over-asking only
+	 * reads a zeroed slot.
+	 */
+	private fun advertisedChannelSlotCount(): Int =
+		(_deviceInfo.value?.maxChannels ?: DEFAULT_CHANNEL_SLOTS).coerceIn(1, MAX_GROUP_CHANNELS)
+
 	suspend fun getChannel(index: Int): Channel {
 		val resp = commandQueue.execute<Response.ChannelInfo>(
 			CommandSerializer.getChannel(index),
 			config.commandTimeout,
 		)
-		return Channel(index = resp.index, name = resp.name)
+		return Channel(index = resp.index, name = resp.name, secret = resp.secret)
 	}
 
 	suspend fun getAllChannels(): List<Channel> {
-		val maxChannels = _deviceInfo.value?.maxChannels?.coerceIn(1, 8) ?: 8
+		val maxChannels = advertisedChannelSlotCount()
 		val channelList = mutableListOf<Channel>()
 		for (i in 0 until maxChannels) {
 			channelList.add(getChannel(i))
@@ -191,24 +295,29 @@ class DeviceConnection internal constructor(
 
 	// --- Messaging ---
 
-	suspend fun sendDirectMessage(publicKeyPrefix: ByteArray, text: String): MessageSentConfirmation {
+	suspend fun sendDirectMessage(
+		publicKeyPrefix: ByteArray,
+		text: String,
+		timestampSeconds: Long? = null,
+		attempt: Int = 0,
+	): MessageSentConfirmation {
 		require(publicKeyPrefix.size == 6) { "Public key prefix must be 6 bytes" }
-		val timestamp = currentTimeSeconds()
+		val timestamp = timestampSeconds ?: currentTimeSeconds()
 		val resp = commandQueue.execute<Response>(
-			CommandSerializer.sendDirectMessage(publicKeyPrefix, text, timestamp),
+			CommandSerializer.sendDirectMessage(publicKeyPrefix, text, timestamp, attempt),
 			config.commandTimeout,
 		)
 		return when (resp) {
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -217,8 +326,12 @@ class DeviceConnection internal constructor(
 		}
 	}
 
-	suspend fun sendChannelMessage(channelIndex: Int, text: String): MessageSentConfirmation {
-		val timestamp = currentTimeSeconds()
+	suspend fun sendChannelMessage(
+		channelIndex: Int,
+		text: String,
+		timestampSeconds: Long? = null,
+	): MessageSentConfirmation {
+		val timestamp = timestampSeconds ?: currentTimeSeconds()
 		val resp = commandQueue.execute<Response>(
 			CommandSerializer.sendChannelMessage(channelIndex, text, timestamp),
 			config.commandTimeout,
@@ -227,13 +340,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -255,11 +368,51 @@ class DeviceConnection internal constructor(
 		}
 	}
 
-	private suspend fun drainMessages() {
+	/**
+	 * One drain slot with bounded CommandTimeout resilience: a single 10s
+	 * GET_MESSAGE timeout inside a drain is retried up to
+	 * [DRAIN_POLL_MAX_ATTEMPTS] total attempts before the error escapes and
+	 * fails the drain. The node's offline queue pops on hand-over with no
+	 * mark-read/ack and a late reply after a timeout is dropped, so a
+	 * transient BLE stall must not consume-and-lose the waiting message.
+	 * Anything but a [MeshCoreException.CommandTimeout] — including
+	 * cancellation — escapes immediately; a null (NoMoreMessages) ends the
+	 * drain, so retries apply per slot, not per drain.
+	 */
+	private suspend fun pollNextMessageWithRetry(): ReceivedMessage? {
+		var attempt = 0
 		while (true) {
-			val msg = pollNextMessage() ?: break
-			_incomingMessages.emit(msg)
+			try {
+				return pollNextMessage()
+			} catch (error: MeshCoreException.CommandTimeout) {
+				attempt++
+				if (attempt >= DRAIN_POLL_MAX_ATTEMPTS) throw error
+			}
 		}
+	}
+
+	private suspend fun drainMessages(trigger: String, waiting: Int? = null) {
+		_drainReports.tryEmit(DrainReport.Started(trigger, waiting))
+		var delivered = 0
+		try {
+			while (true) {
+				val msg = pollNextMessageWithRetry() ?: break
+				_incomingMessages.emit(msg)
+				delivered++
+			}
+		} catch (cancelled: CancellationException) {
+			throw cancelled
+		} catch (error: Exception) {
+			_drainReports.tryEmit(
+				DrainReport.Failed(
+					trigger = trigger,
+					delivered = delivered,
+					reason = error.message ?: error::class.simpleName ?: "unknown",
+				),
+			)
+			throw error
+		}
+		_drainReports.tryEmit(DrainReport.Completed(trigger, delivered))
 	}
 
 	// --- Raw Data / Binary ---
@@ -279,7 +432,7 @@ class DeviceConnection internal constructor(
 		return MessageSentConfirmation(
 			messageType = resp.messageType,
 			expectedAck = resp.expectedAck,
-			suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+			suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 		)
 	}
 
@@ -296,13 +449,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -334,10 +487,26 @@ class DeviceConnection internal constructor(
 		name: String,
 		type: Int,
 		flags: Int,
-		outPath: ByteArray = ByteArray(64),
+		outPath: ByteArray = ByteArray(0),
+		outPathLen: Int = 0,
+		outPathHashMode: Int = 0,
+		lastAdvertTimestamp: Long = 0,
+		gpsLatitude: Double? = null,
+		gpsLongitude: Double? = null,
 	) {
 		commandQueue.execute<Response.Ok>(
-			CommandSerializer.updateContact(publicKey, name, type, flags, outPath),
+			CommandSerializer.updateContact(
+				publicKey,
+				name,
+				type,
+				flags,
+				outPath,
+				outPathLen,
+				outPathHashMode,
+				lastAdvertTimestamp,
+				gpsLatitude,
+				gpsLongitude,
+			),
 			config.commandTimeout,
 		)
 	}
@@ -416,6 +585,51 @@ class DeviceConnection internal constructor(
 		)
 		_contacts.value = contactList
 		return contactList
+	}
+
+	/**
+	 * Incremental contact refresh: asks the node for only the contacts whose
+	 * `lastmod` is greater than [since] (firmware `MyMesh.cpp:2355`, request
+	 * shape `[0x04][since as 4-byte LE]`) and returns that delta together with
+	 * the stream's cursor data.
+	 *
+	 * Unlike [getContacts], this does NOT publish to [contacts]: a filtered
+	 * reply is a delta, not the full list, so the caller merges it into the
+	 * contacts it already holds and owns publication.
+	 */
+	suspend fun getContactsSince(since: Int): ContactFetch {
+		val contactList = mutableListOf<Contact>()
+		var totalAtStart = 0
+		var mostRecentLastmod = 0L
+		commandQueue.executeStreaming<Response.ContactEnd>(
+			CommandSerializer.getContacts(since),
+			config.commandTimeout,
+			onResponse = { response ->
+				when (response) {
+					is Response.Contact -> {
+						contactList.add(response.toDomainModel())
+						true // continue
+					}
+
+					is Response.ContactEnd -> {
+						mostRecentLastmod = response.mostRecentLastmod
+						false // stop
+					}
+
+					is Response.ContactStart -> {
+						totalAtStart = response.total
+						true // continue
+					}
+
+					else -> true // ignore others?
+				}
+			}
+		)
+		return ContactFetch(
+			contacts = contactList,
+			totalAtStart = totalAtStart,
+			mostRecentLastmod = mostRecentLastmod,
+		)
 	}
 
 	// --- Stats ---
@@ -574,13 +788,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -609,13 +823,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -647,13 +861,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -744,13 +958,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -769,13 +983,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -808,13 +1022,13 @@ class DeviceConnection internal constructor(
 			is Response.MessageSent -> MessageSentConfirmation(
 				messageType = resp.messageType,
 				expectedAck = resp.expectedAck,
-				suggestedTimeoutSeconds = resp.suggestedTimeoutSeconds,
+				suggestedTimeoutMillis = resp.suggestedTimeoutMillis,
 			)
 
 			is Response.Ok -> MessageSentConfirmation(
 				messageType = 0,
 				expectedAck = "",
-				suggestedTimeoutSeconds = 0,
+				suggestedTimeoutMillis = 0,
 			)
 
 			else -> throw MeshCoreException.UnexpectedResponse(
@@ -845,12 +1059,19 @@ class DeviceConnection internal constructor(
 	suspend fun sendAndAwaitAck(
 		block: suspend DeviceConnection.() -> MessageSentConfirmation,
 	): Result<MessageSentConfirmation> {
-		// Buffer acks before sending so we don't miss fast responses
+		// Buffer acks before sending so we don't miss fast responses.
+		// UNDISPATCHED subscribes before [block] runs. A Channel — not a
+		// second SharedFlow collector — keeps an ACK that arrived while
+		// MSG_SENT was still nested in CommandQueue's incoming collector.
 		val receivedAcks = mutableSetOf<String>()
-		val collectorJob = scope.launch {
+		val arrivals = CoroutineChannel<String>(CoroutineChannel.UNLIMITED)
+		val collectorJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
 			commandQueue.pushEvents
 				.filterIsInstance<Response.Ack>()
-				.collect { receivedAcks.add(it.ackCode) }
+				.collect {
+					receivedAcks.add(it.ackCode)
+					arrivals.trySend(it.ackCode)
+				}
 		}
 
 		try {
@@ -858,20 +1079,32 @@ class DeviceConnection internal constructor(
 
 			if (confirmation.expectedAck.isEmpty()) return Result.success(confirmation)
 
-			// Check if ack already arrived while sending
+			// MSG_SENT and the ACK push are often one BLE burst. Yield so
+			// CommandQueue can finish routing the ACK before we decide it
+			// missed and wait the node's full suggested timeout.
+			yield()
+
 			if (confirmation.expectedAck in receivedAcks) return Result.success(confirmation)
 
-			val timeoutMs = if (confirmation.suggestedTimeoutSeconds > 0) {
-				confirmation.suggestedTimeoutSeconds * 1000L
+			val timeoutMs = if (confirmation.suggestedTimeoutMillis > 0) {
+				// The node already reports milliseconds (firmware
+				// calcDirectTimeoutMillisFor / calcFloodTimeoutMillisFor).
+				// Clamped: the field is a raw uint32 off the wire, so a garbled
+				// frame must not park the caller for hours — floods on the
+				// slowest spreading factors estimate well under two minutes.
+				confirmation.suggestedTimeoutMillis.toLong().coerceAtMost(MAX_ACK_WAIT_MILLIS)
 			} else {
 				config.commandTimeout.inWholeMilliseconds
 			}
 
-			// Wait for matching ack, re-checking the buffer on each emission
 			val matched = withTimeoutOrNull(timeoutMs) {
-				commandQueue.pushEvents
-					.filterIsInstance<Response.Ack>()
-					.first { it.ackCode == confirmation.expectedAck }
+				if (confirmation.expectedAck in receivedAcks) {
+					return@withTimeoutOrNull confirmation.expectedAck
+				}
+				while (true) {
+					val code = arrivals.receive()
+					if (code == confirmation.expectedAck) return@withTimeoutOrNull code
+				}
 			}
 
 			return if (matched != null || confirmation.expectedAck in receivedAcks) {
@@ -883,6 +1116,7 @@ class DeviceConnection internal constructor(
 			}
 		} finally {
 			collectorJob.cancel()
+			arrivals.close()
 		}
 	}
 
@@ -894,6 +1128,9 @@ class DeviceConnection internal constructor(
 			name = name,
 			type = type,
 			flags = flags,
+			outPath = outPath,
+			outPathLen = outPathLen,
+			outPathHashMode = outPathHashMode,
 			lastAdvertTimestamp = lastAdvertTimestamp,
 			gpsLatitude = gpsLatitude,
 			gpsLongitude = gpsLongitude,
@@ -950,4 +1187,8 @@ class DeviceConnection internal constructor(
 
 	private fun currentTimeSeconds(): Long =
 		kotlin.time.Clock.System.now().epochSeconds
+
+	companion object {
+		private const val TAG = "MeshCoreBLE"
+	}
 }

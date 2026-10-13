@@ -4,6 +4,7 @@ import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 
 class CommandSerializerTest {
 
@@ -67,18 +68,64 @@ class CommandSerializerTest {
 	}
 
 	@Test
+	fun getContacts_noSince_isBareCommand() {
+		// CMD_GET_CONTACTS is 0x04 (MyMesh.cpp:9) — a different namespace from
+		// RESP_CODE_CONTACTS_START/RESP_CODE_END_OF_CONTACTS, which are 0x02/0x04.
+		assertContentEquals(byteArrayOf(0x04), CommandSerializer.getContacts())
+		assertContentEquals(byteArrayOf(0x04), CommandSerializer.getContacts(null))
+	}
+
+	@Test
+	fun getContacts_withSince_encodesLittleEndian() {
+		// 0x01020304 LE → 04 03 02 01 after the command byte; the firmware
+		// reads the optional param when len >= 5 (MyMesh.cpp:1329).
+		val result = CommandSerializer.getContacts(0x01020304)
+		assertContentEquals(byteArrayOf(0x04, 0x04, 0x03, 0x02, 0x01), result)
+	}
+
+	@Test
 	fun getChannel_validIndex() {
 		val result = CommandSerializer.getChannel(3)
 		assertContentEquals(byteArrayOf(0x1F, 0x03), result)
 	}
 
 	@Test
+	fun getChannel_acceptsSlotsAboveSeven() {
+		// The firmware advertises its slot count in DEVICE_QUERY byte 3 (40 on
+		// almost every variant) and answers GET_CHANNEL for every slot below
+		// it, so 8..39 are ordinary requests, not malformed ones.
+		assertContentEquals(byteArrayOf(0x1F, 0x08), CommandSerializer.getChannel(8))
+		assertContentEquals(byteArrayOf(0x1F, 0x27), CommandSerializer.getChannel(39))
+	}
+
+	@Test
 	fun getChannel_invalidIndex() {
 		assertFailsWith<IllegalArgumentException> {
-			CommandSerializer.getChannel(8)
+			CommandSerializer.getChannel(40)
 		}
 		assertFailsWith<IllegalArgumentException> {
 			CommandSerializer.getChannel(-1)
+		}
+	}
+
+	@Test
+	fun setChannel_sixteenByteSecret_producesFiftyByteFrame() {
+		// The node firmware takes only the 16-byte secret form
+		// (2 + 32 name + 16 secret = 50) and answers ERR to the 66-byte one.
+		val secret = ByteArray(16) { (it + 1).toByte() }
+		val result = CommandSerializer.setChannel(9, "Private", secret)
+		assertEquals(50, result.size)
+		assertEquals(0x20.toByte(), result[0])
+		assertEquals(0x09.toByte(), result[1])
+		// "Private" = 7 bytes at 2..8, zero-padded through 33.
+		assertEquals('P'.code.toByte(), result[2])
+		assertEquals('e'.code.toByte(), result[8])
+		for (i in 9..33) {
+			assertEquals(0x00.toByte(), result[i])
+		}
+		// Secret occupies the remaining 16 bytes at 34..49.
+		for (i in 0 until 16) {
+			assertEquals((i + 1).toByte(), result[34 + i])
 		}
 	}
 
@@ -101,14 +148,43 @@ class CommandSerializerTest {
 	@Test
 	fun setChannel_invalidSecret() {
 		assertFailsWith<IllegalArgumentException> {
-			CommandSerializer.setChannel(1, "Test", ByteArray(16))
+			CommandSerializer.setChannel(1, "Test", ByteArray(20))
+		}
+	}
+
+	@Test
+	fun setChannel_truncatesLongNameOnUtf8Boundary() {
+		// 29 ASCII bytes + panda + "tail" = 37 bytes. The 32-byte name field
+		// must lose the whole panda (29 bytes kept), never leave 3 dangling
+		// bytes that decode to U+FFFD garbage.
+		val name = "x".repeat(29) + "🐼tail"
+		val nameBytes = name.encodeToByteArray()
+		assertEquals(37, nameBytes.size)
+		val result = CommandSerializer.setChannel(1, name, ByteArray(32))
+		assertEquals(66, result.size)
+		val occupied = result.copyOfRange(2, 34).takeWhile { it != 0x00.toByte() }.toByteArray()
+		assertEquals(29, occupied.size)
+		assertEquals("x".repeat(29), occupied.decodeToString())
+		assertFalse(occupied.decodeToString().contains('\uFFFD'))
+	}
+
+	@Test
+	fun setChannel_nameOfExactlyThirtyTwoBytes_isKeptWhole() {
+		// A trailing sequence that fits exactly must not be dropped.
+		val name = "x".repeat(28) + "🐼"
+		val nameBytes = name.encodeToByteArray()
+		assertEquals(32, nameBytes.size)
+		val result = CommandSerializer.setChannel(1, name, ByteArray(32))
+		assertEquals(66, result.size)
+		for (i in 0 until 32) {
+			assertEquals(nameBytes[i], result[2 + i])
 		}
 	}
 
 	@Test
 	fun deleteChannel() {
 		val result = CommandSerializer.deleteChannel(2)
-		assertEquals(66, result.size)
+		assertEquals(50, result.size)
 		assertEquals(0x20.toByte(), result[0])
 		assertEquals(0x02.toByte(), result[1])
 		// Name should be all zeros
@@ -116,7 +192,7 @@ class CommandSerializerTest {
 			assertEquals(0x00.toByte(), result[i])
 		}
 		// Secret should be all zeros
-		for (i in 34..65) {
+		for (i in 34..49) {
 			assertEquals(0x00.toByte(), result[i])
 		}
 	}
@@ -251,13 +327,86 @@ class CommandSerializerTest {
 	fun addContact_correctLayout() {
 		val publicKey = ByteArray(32) { it.toByte() }
 		val result = CommandSerializer.addContact(publicKey, "Alice", type = 1, flags = 2)
-		assertEquals(131, result.size)
+		// 1 cmd + 32 key + 1 type + 1 flags + 1 path_len + 64 path + 32 name
+		// + 4 last_advert + 4 lat + 4 lon = 144
+		assertEquals(144, result.size)
 		assertEquals(0x09.toByte(), result[0])
 		assertEquals(0x00.toByte(), result[1]) // first byte of key
 		assertEquals(0x1F.toByte(), result[32]) // last byte of key
 		assertEquals(0x01.toByte(), result[33]) // type
 		assertEquals(0x02.toByte(), result[34]) // flags
-		assertEquals('A'.code.toByte(), result[99]) // name start
+		assertEquals(0x00.toByte(), result[35]) // path_len = 0, no path
+		assertEquals('A'.code.toByte(), result[100]) // name start
+	}
+
+	@Test
+	fun updateContact_echoesPathAndAdvertFields() {
+		val publicKey = ByteArray(32) { it.toByte() }
+		val path = byteArrayOf(0x0A, 0x0B, 0x0C)
+		val result =
+			CommandSerializer.updateContact(
+				publicKey = publicKey,
+				name = "🐼 Al",
+				type = 0,
+				flags = 1,
+				outPath = path,
+				outPathLen = 3,
+				outPathHashMode = 1,
+				lastAdvertTimestamp = 1_700_000_000L,
+				gpsLatitude = 48.85837,
+				gpsLongitude = 2.294481,
+			)
+		assertEquals(144, result.size)
+		// path_len byte packs len (low 6 bits) + hash mode (high 2 bits)
+		assertEquals((3 or (1 shl 6)).toByte(), result[35])
+		assertEquals(0x0A.toByte(), result[36])
+		assertEquals(0x0C.toByte(), result[38])
+		assertEquals(0x00.toByte(), result[39]) // zero-padded past the path
+		// emoji name lands byte-intact at offset 100
+		val nameBytes = "🐼 Al".encodeToByteArray()
+		assertEquals(7, nameBytes.size)
+		for (i in nameBytes.indices) {
+			assertEquals(nameBytes[i], result[100 + i])
+		}
+		assertEquals(0x00.toByte(), result[107]) // zero-padded past the name
+		// trailing advert fields round-trip through the response parser layout
+		assertEquals(1_700_000_000L, ResponseParser.getUInt32LE(result, 132))
+		assertEquals((48.85837 * 1_000_000).toInt(), ResponseParser.getInt32LE(result, 136))
+		assertEquals((2.294481 * 1_000_000).toInt(), ResponseParser.getInt32LE(result, 140))
+	}
+
+	@Test
+	fun updateContact_floodPathEncodes255() {
+		val publicKey = ByteArray(32) { it.toByte() }
+		val result =
+			CommandSerializer.updateContact(
+				publicKey = publicKey,
+				name = "Bob",
+				type = 0,
+				flags = 0,
+				outPathLen = -1,
+				outPathHashMode = -1,
+			)
+		assertEquals(0xFF.toByte(), result[35])
+		assertEquals('B'.code.toByte(), result[100])
+	}
+
+	@Test
+	fun truncateUtf8_keepsWholeSequencesOnly() {
+		// 29 ASCII bytes + panda (4 bytes) = 33 bytes; cut at 32 must drop
+		// the whole panda, not leave 3 dangling bytes behind.
+		val over = ("x".repeat(29) + "🐼").encodeToByteArray()
+		assertEquals(33, over.size)
+		val cut = CommandSerializer.truncateUtf8(over, 32)
+		assertEquals(29, cut.size)
+		assertEquals("x".repeat(29), cut.decodeToString())
+		// Exact fit is untouched.
+		val exact = "🐼 Al".encodeToByteArray()
+		assertEquals(exact.toList(), CommandSerializer.truncateUtf8(exact, 32).toList())
+		// Pure ASCII cuts mid-string cleanly.
+		assertEquals("abc", "abcdef".encodeToByteArray().let {
+			CommandSerializer.truncateUtf8(it, 3).decodeToString()
+		})
 	}
 
 	@Test
